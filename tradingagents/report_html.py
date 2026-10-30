@@ -13,7 +13,13 @@ from importlib.resources import files
 from markdown_it import MarkdownIt
 
 from tradingagents.agents.rating import run_rating
-from tradingagents.reporting import analyst_names
+from tradingagents.reporting import (
+    analyst_names,
+    disclaimer_for,
+    horizon_line,
+    is_intraday_run,
+    market_line,
+)
 
 # Ratings by direction, so the page can show which way the call leans.
 _TONE = {"Buy": "up", "Overweight": "up", "Hold": "level", "Underweight": "down", "Sell": "down"}
@@ -122,6 +128,9 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .contents, .contents .label { transition: none; }
 }
 
+/* What the report is, above the credit: research, not advice. */
+.disclaimer { margin-top: 4rem; color: var(--muted); font: 0.8rem/1.5 var(--sans); }
+
 /* The maker's credit: one quiet line at the foot. */
 .credit { margin-top: 4.5rem; padding-top: 1.25rem; border-top: 1px solid var(--rule);
   color: var(--muted); font: 0.8rem/1.4 var(--sans); }
@@ -204,6 +213,7 @@ def _render_agent_text(md: MarkdownIt, text: str) -> str:
 _CATEGORY = {
     "core_stock_apis": "Prices", "technical_indicators": "Indicators", "fundamental_data": "Fundamentals",
     "news_data": "News", "macro_data": "Macro", "prediction_markets": "Prediction markets",
+    "intraday_data": "Intraday bars",
 }
 
 
@@ -221,9 +231,12 @@ def _group(name: str, values_html: str) -> str:
     return f'<span class="group"><span class="name">{escape(name)}</span>{values_html}</span>'
 
 
-def _run_details(final_state: dict, settings: dict | None) -> list[tuple[str, str]]:
+def _run_details(final_state: dict, settings: dict | None, ticker: str = "") -> list[tuple[str, str]]:
     """The run details as (label, value HTML); every value from the run is escaped."""
     details = [("Generated", escape(datetime.now().strftime("%Y-%m-%d %H:%M")))]
+    market = market_line(ticker)
+    if market:
+        details.append(("Market", escape(market)))
     if settings:
         s = settings.get
         for tier in ("deep", "quick"):
@@ -240,8 +253,13 @@ def _run_details(final_state: dict, settings: dict | None) -> list[tuple[str, st
                 _group(_CATEGORY.get(k, k), _chain(v)) for k, v in vendors.items()
             )))
         details.append(("Version", escape(f"TradingAgents {s('version', '?')}")))
+    horizon = horizon_line(final_state, settings)
+    if horizon:
+        details.append(("Horizon", escape(horizon)))
     if final_state.get("memory_note"):
         details.append(("Memory log", escape(final_state["memory_note"])))
+    if final_state.get("arena_note"):
+        details.append(("AlphArena", escape(final_state["arena_note"])))
     return details
 
 
@@ -258,7 +276,7 @@ def render_report(ticker: str, final_state: dict, settings: dict | None, parts) 
     details = "".join(
         f'<div class="{"note" if label == "Memory log" else "detail"}">'
         f"<dt>{escape(label)}</dt><dd>{value}</dd></div>"
-        for label, value in _run_details(final_state, settings)
+        for label, value in _run_details(final_state, settings, ticker)
     )
 
     contents, body = [], []
@@ -297,6 +315,7 @@ def render_report(ticker: str, final_state: dict, settings: dict | None, parts) 
 <main>
 {"".join(body)}
 </main>
+<p class="disclaimer">{escape(disclaimer_for(ticker, is_intraday_run(final_state, settings)))}</p>
 <footer class="credit"><a href="{_PROJECT}" rel="noopener">TradingAgents</a> powered by <a class="brand" href="{_ORG}" rel="noopener">Tauric Research</a></footer>
 </div>
 <a class="to-top" href="#top">Top</a>

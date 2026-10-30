@@ -8,6 +8,7 @@ day (#1330).
 from __future__ import annotations
 
 import os
+import time
 from types import SimpleNamespace
 
 import pandas as pd
@@ -111,3 +112,102 @@ def test_one_cache_file_per_symbol_across_days(tmp_path, monkeypatch):
 
     assert len(downloads) == 3, "each new day refetches"
     assert [p.name for p in tmp_path.iterdir()] == ["AAPL-YFin-data.csv"]
+
+
+# --- "today" is the listing's own date ------------------------------------------
+# A US session runs 19:00-01:30 in India (EDT), across the machine's midnight. A
+# download made just after that midnight holds the US day's bar while it is still
+# forming, and a run dated that US day counts as past by the machine's date.
+
+@pytest.fixture
+def clock(request):
+    """The machine's clock in the time zone the test is parametrized with."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("setting the machine's time zone needs time.tzset, which Windows lacks")
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
+    time.tzset()
+    yield
+    if previous is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = previous
+    time.tzset()
+
+
+def _cached(tmp_path, symbol, written, closes):
+    f = tmp_path / f"{symbol}-YFin-data.csv"
+    pd.DataFrame({"Date": ["2026-10-27", "2026-10-28"], "Close": closes}).to_csv(f, index=False)
+    _stamp(f, pd.Timestamp(written))
+    return f
+
+
+def _load_at(tmp_path, monkeypatch, symbol, now, as_of, closes):
+    """load_ohlcv at the machine-local ``now``; returns (frame, downloads made)."""
+    downloads = []
+    final = pd.DataFrame({"Date": pd.to_datetime(["2026-10-27", "2026-10-28"]), "Close": closes})
+    monkeypatch.setattr(ohlcv, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    monkeypatch.setattr(ohlcv.pd.Timestamp, "today", staticmethod(lambda: pd.Timestamp(now)))
+    monkeypatch.setattr(ohlcv.yf, "Ticker", lambda s: SimpleNamespace(
+        history=lambda *a, **k: downloads.append(s) or final.set_index("Date")))
+    return ohlcv.load_ohlcv(symbol, as_of), downloads
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("clock", ["Asia/Kolkata"], indirect=True)
+def test_a_us_bar_cached_while_its_session_traded_is_not_served_as_its_close(tmp_path, monkeypatch, clock):
+    # Written 00:30 IST on the 29th = 15:00 in New York on the 28th, before the close;
+    # read 09:00 IST on the 29th = 23:30 in New York, after it, for a run dated the 28th.
+    _cached(tmp_path, "AAPL", "2026-10-29 00:30", [100.0, 101.0])
+
+    out, downloads = _load_at(tmp_path, monkeypatch, "AAPL", "2026-10-29 09:00", "2026-10-28", [100.0, 105.0])
+
+    assert downloads == ["AAPL"], "the download made while the US session traded must be refetched"
+    assert out["Close"].iloc[-1] == 105.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("clock", ["Asia/Kolkata"], indirect=True)
+def test_a_past_us_run_reuses_the_download_of_new_yorks_day(tmp_path, monkeypatch, clock):
+    # Written 10:00 IST on the 29th = 00:30 in New York on the 29th, read 18:00 IST =
+    # 08:30 in New York: the 28th is past by New York's date, so #1150 reuses the file.
+    _cached(tmp_path, "AAPL", "2026-10-29 10:00", [100.0, 105.0])
+
+    out, downloads = _load_at(tmp_path, monkeypatch, "AAPL", "2026-10-29 18:00", "2026-10-28", [0.0, 0.0])
+
+    assert downloads == [] and out["Close"].iloc[-1] == 105.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("clock", ["Asia/Kolkata"], indirect=True)
+def test_a_us_run_dated_new_yorks_today_refetches_past_the_ttl(tmp_path, monkeypatch, clock):
+    # 09:00 IST on the 29th is 23:30 in New York on the 28th: a run dated the 28th is a
+    # current-day run there, so the TTL governs as it does for a run dated today (#1150).
+    _cached(tmp_path, "AAPL", "2026-10-29 03:00", [100.0, 105.0])
+
+    _, downloads = _load_at(tmp_path, monkeypatch, "AAPL", "2026-10-29 09:00", "2026-10-28", [100.0, 105.0])
+
+    assert downloads == ["AAPL"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("clock", ["America/New_York"], indirect=True)
+def test_an_indian_listing_is_judged_by_indias_date(tmp_path, monkeypatch, clock):
+    # Written 23:00 in New York on the 28th = 08:30 IST on the 29th, after the 28th's
+    # NSE close and before the 29th's open: it already holds the 28th's final bar.
+    _cached(tmp_path, "RELIANCE.NS", "2026-10-28 23:00", [100.0, 105.0])
+
+    out, downloads = _load_at(tmp_path, monkeypatch, "RELIANCE.NS", "2026-10-28 23:30", "2026-10-28", [0.0, 0.0])
+
+    assert downloads == [] and out["Close"].iloc[-1] == 105.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("clock", ["Asia/Kolkata"], indirect=True)
+@pytest.mark.parametrize("symbol", ["VOD.L", "BTC-USD", "^GSPC", "EURUSD=X"])
+def test_other_listings_keep_the_machines_date(tmp_path, monkeypatch, clock, symbol):
+    _cached(tmp_path, symbol, "2026-10-29 00:30", [100.0, 101.0])
+
+    out, downloads = _load_at(tmp_path, monkeypatch, symbol, "2026-10-29 09:00", "2026-10-28", [0.0, 0.0])
+
+    assert downloads == [] and out["Close"].iloc[-1] == 101.0

@@ -1,8 +1,12 @@
+import logging
+import re
 from typing import Annotated
 
+import pandas as pd
 import yfinance as yf
 
 from tradingagents.dataflows.date_window import (
+    get_current_date,
     withhold_live_profile,
     withhold_undated_statements,
     withhold_undisclosed_trades,
@@ -12,9 +16,14 @@ from tradingagents.dataflows.net import vendor_reachable
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import (
     YAHOO_HOST,
+    price_text,
     raise_for_empty,
     yf_retry,
 )
+from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
+from tradingagents.markets.exchanges import exchange_for_symbol
+
+logger = logging.getLogger(__name__)
 
 # Quote currencies Yahoo gives in a minor unit, and the main unit of each.
 _MAIN_UNIT = {"GBp": "GBP", "GBX": "GBP", "ZAc": "ZAR", "ILA": "ILS"}
@@ -163,7 +172,57 @@ def get_insider_transactions(
             raise VendorUnavailableError("Yahoo Finance is unreachable; insider filings were not retrieved")
         return f"No insider transactions reported for symbol '{canonical}'"
 
-    return f"# Insider Transactions data for {canonical}\n" + data.to_csv()
+    note = _insider_price_note(canonical, data, as_of_date)
+    return f"# Insider Transactions data for {canonical}\n" + data.to_csv() + note
+
+
+_PRICE_IN_TEXT = re.compile(r"at price ([\d,]*\.?\d+) per share", re.IGNORECASE)
+
+
+def _insider_price_note(canonical: str, data: pd.DataFrame, as_of_date: str | None) -> str:
+    """A note when an NSE/BSE listing's insider prices do not fit its own closes, else "".
+
+    Yahoo gives no currency for these rows, and for Indian listings their
+    per-share prices have been far below the stock's INR closes. The prices are
+    read from the Text column ("Sale at price 15.69 per share.") and the median
+    is held to half the lowest and twice the highest close over the same dates.
+    """
+    exchange = exchange_for_symbol(canonical)
+    if exchange is None or not {"Text", "Start Date"} <= set(data.columns):
+        return ""
+    prices = pd.to_numeric(
+        data["Text"].astype(str).str.extract(_PRICE_IN_TEXT)[0].str.replace(",", ""), errors="coerce")
+    dates = pd.to_datetime(data["Start Date"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(dates):
+        return ""
+    if dates.dt.tz is not None:
+        dates = dates.dt.tz_localize(None)
+    rows = pd.DataFrame({"date": dates.dt.normalize(), "price": prices}).dropna()
+    rows = rows[rows["price"] > 0]
+    if rows.empty:
+        return ""
+    try:
+        bars = load_ohlcv(canonical, as_of_date or get_current_date(), fill_gaps=False)
+    except Exception as exc:  # the note is optional: without closes the rows stand as Yahoo gave them
+        logger.debug("No closes to check %s insider prices against: %s", canonical, exc)
+        return ""
+    # A trade dated on a holiday is read against the sessions just before it.
+    span = (bars["Date"] >= rows["date"].min() - pd.Timedelta(days=7)) & (bars["Date"] <= rows["date"].max())
+    closes = bars.loc[span, "Close"].dropna()
+    if closes.empty:
+        return ""
+    low, high = closes.min(), closes.max()
+    if 0.5 * low <= rows["price"].median() <= 2 * high:
+        return ""
+    currency = exchange.currency
+    return (
+        f"\nNote: Yahoo does not state the currency of these prices and values. Their per-share "
+        f"prices ({price_text(rows['price'].min())}-{price_text(rows['price'].max())}) do not match "
+        f"{canonical}'s {currency} closes over the same period ({price_text(low)}-{price_text(high)}), so "
+        f"they are not rupee amounts and must not be compared with {currency} prices or read as "
+        f"rupee values. Indian insider trades are disclosed on NSE/BSE under SEBI's insider-trading "
+        f"(PIT) regulations.\n"
+    )
 
 
 def get_company_profile(ticker: str) -> dict:

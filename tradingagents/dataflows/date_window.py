@@ -8,12 +8,17 @@
   after ``end``, and an undated item kept only when the window reaches the
   present, since a backtest cannot prove it is not from the future (#1126, #1220).
 - ``coverage_gap`` reports a window a feed cannot reach as unavailable, not empty.
+- ``is_historical`` tells a past-dated run from a current one, "today" being the
+  listing's date where it is behind the machine's (``today_for``).
 - ``withhold_live_profile`` withholds present-day snapshots from historical runs.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+
+from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.symbols import listing_zone
 
 
 def to_utc(dt: datetime) -> datetime:
@@ -37,9 +42,35 @@ def get_current_date() -> str:
     return date.today().strftime("%Y-%m-%d")
 
 
-def is_historical(run_date) -> bool:
-    """Whether a run is dated before today, so live-only data would come from after it."""
-    return bool(run_date) and str(run_date) < get_current_date()
+def listing_date(symbol: str | None, now: datetime | None = None) -> str | None:
+    """The listing's own date at ``now`` (an aware time; default now), YYYY-MM-DD, or
+    None when its time zone is not known (``symbols.listing_zone``)."""
+    zone = listing_zone(symbol)
+    if zone is None:
+        return None
+    return (now or datetime.now(UTC)).astimezone(zone).strftime("%Y-%m-%d")
+
+
+def today_for(symbol: str | None = None) -> str:
+    """Today for a run on ``symbol``, else on the run's listing (``run_symbol``), YYYY-MM-DD.
+
+    The machine's date, or the listing's when that is earlier. In India the date
+    turns at midnight while the US session that opened the evening before still
+    trades, so a US run dated New York's day stays a current run until New York's
+    own midnight. A listing ahead of the machine never makes it later: no day the
+    machine has not reached counts as today, so nothing newer can be let in.
+    """
+    today = get_current_date()
+    local = listing_date(symbol or get_config().get("run_symbol"))
+    return min(today, local) if local else today
+
+
+def is_historical(run_date, symbol: str | None = None) -> bool:
+    """Whether a run is dated before today (``today_for``), so live-only data would come from after it.
+
+    ``symbol`` is the listing whose date counts; without one, the run's.
+    """
+    return bool(run_date) and str(run_date) < today_for(symbol)
 
 
 def coverage_gap(
@@ -60,7 +91,10 @@ def coverage_gap(
     """
     now = datetime.now(UTC)
     oldest = min((to_utc(d) for d in dates if d is not None), default=now)
-    if datetime.strptime(end_date, "%Y-%m-%d").date() > now.date():
+    # The later of UTC's date and the machine's: from midnight to 05:30 in India the
+    # machine's date is ahead of UTC's, and a window ending on it is not in the future.
+    today = max(now.date(), date.fromisoformat(get_current_date()))
+    if datetime.strptime(end_date, "%Y-%m-%d").date() > today:
         reason = "the window extends past today"
     elif oldest.date() > datetime.strptime(start_date, "%Y-%m-%d").date():
         reason = "it only serves recent items"
@@ -119,9 +153,10 @@ def withhold_live_profile(as_of_date: str | None, label: str) -> str | None:
     industry, which move when a company renames or is reclassified — so serving
     one into a run dated in the past leaks post-decision information (#1300).
     Every fundamentals vendor withholds on this rule, so switching between them
-    cannot reintroduce the leak.
+    cannot reintroduce the leak. ``label`` is the ticker, whose listing's date
+    is today's (``today_for``); the other ``withhold_*`` rules read it the same way.
     """
-    if not is_historical(as_of_date):
+    if not is_historical(as_of_date, label):
         return None
     return (
         f"# Company Fundamentals for {label}\n"
@@ -145,7 +180,7 @@ def withhold_undisclosed_trades(as_of_date: str | None, label: str) -> str | Non
     business days later. A past run is told so rather than served trades that
     may not yet have been disclosed.
     """
-    if not is_historical(as_of_date):
+    if not is_historical(as_of_date, label):
         return None
     return (
         f"# Insider Transactions for {label}\n"
@@ -165,7 +200,7 @@ def withhold_undated_statements(as_of_date: str | None, label: str, title: str) 
     were not yet known. A past run is told so; SEC EDGAR, which dates every
     filing, serves US filers as filed.
     """
-    if not is_historical(as_of_date):
+    if not is_historical(as_of_date, label):
         return None
     return (
         f"# {title} for {label}\n"

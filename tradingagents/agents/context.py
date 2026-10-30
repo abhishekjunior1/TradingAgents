@@ -3,10 +3,13 @@
 import functools
 import logging
 from collections.abc import Mapping
+from datetime import date, datetime
 from typing import Any
 
 from tradingagents.dataflows.date_window import is_historical
 from tradingagents.dataflows.vendors.yahoo.fundamentals import get_company_profile
+from tradingagents.markets.exchanges import day_status, exchange_for_symbol, session_status
+from tradingagents.markets.india import EVIDENCE_RULES, market_briefing
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +107,34 @@ def _identity(ticker: str) -> dict:
     return identity
 
 
+def _market_context(ticker: str, trade_date: str | None, now: datetime | None) -> str:
+    """The exchange's rules and the run date's session, for an instrument on an exchange known here.
+
+    A current run is told the exchange's state now (open, closed, holiday) and
+    the latest complete session; a historical run only whether its own date
+    traded, so it is never told today's date.
+    """
+    exchange = exchange_for_symbol(ticker)
+    if exchange is None:
+        return ""
+    if trade_date and is_historical(trade_date, ticker):
+        day = date.fromisoformat(trade_date)
+        when = day_status(exchange, day)
+    else:
+        status = session_status(exchange, now)
+        day, when = status.local_time.date(), status.describe()
+    return (
+        f" Market: {exchange.name} ({exchange.code}), benchmark {exchange.benchmark_name} "
+        f"(`{exchange.benchmark}`). {when} {market_briefing(exchange.code, exchange.currency, day)}"
+    )
+
+
 def build_instrument_context(
     ticker: str,
     asset_type: str = "stock",
     identity: Mapping[str, str] | None = None,
     trade_date: str | None = None,
+    now: datetime | None = None,
 ) -> str:
     """Describe the exact instrument so agents preserve identity and ticker.
 
@@ -122,20 +148,23 @@ def build_instrument_context(
     company apart from others rather than as what it was called then; a sector,
     industry or exchange it holds today is not given, since it may not have held
     on the analysis date.
+
+    An NSE/BSE instrument also gets its exchange's rules and session (see
+    ``_market_context``), and every instrument the evidence rules agents cite by.
     """
     is_crypto = asset_type == "crypto"
     instrument_label = "asset" if is_crypto else "instrument"
     context = (
         f"The {instrument_label} to analyze is `{ticker}`. "
         "The tools serve this instrument; refer to it by this exact ticker in every report and recommendation, "
-        "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`, `-USD`)."
+        "preserving any exchange suffix (e.g. `.NS`, `.BO`, `.TO`, `.L`, `.HK`, `.T`, `-USD`)."
     )
 
     identity = identity or {}
     name = identity.get("company_name") or identity.get("name")
     label = "Name" if is_crypto else "Company"
     details = []
-    if is_historical(trade_date):
+    if is_historical(trade_date, ticker):
         if name:
             details.append(
                 f"{label}: {name} (its current name, given only to identify it; "
@@ -166,7 +195,9 @@ def build_instrument_context(
             " Treat it as a crypto asset rather than a company, and do not "
             "assume company fundamentals are available."
         )
-    return context
+    else:
+        context += _market_context(ticker, trade_date, now)
+    return context + " " + EVIDENCE_RULES
 
 
 def get_instrument_context_from_state(state: Mapping[str, Any]) -> str:
@@ -199,6 +230,19 @@ def report_or_absent(text: str, source: str) -> str:
     if text:
         return text
     return f"(No {source} report in this run: it is not available, not an empty finding.)"
+
+
+def day_trader_report_line(state: Mapping[str, Any], label: str) -> str:
+    """``label: <the Day Trader's report>`` and a newline, for an agent listing the analysts' reports.
+
+    Given when the analyst ran; in intraday mode, where it always runs, a missing
+    report is said to be missing. A swing run without it gets nothing, so its
+    prompts read as before.
+    """
+    text = state.get("intraday_report") or ""
+    if not text.strip() and state.get("decision_horizon") != "intraday":
+        return ""
+    return f"{label}: {report_or_absent(text, 'day trader')}\n"
 
 
 def get_portfolio_context_from_state(state: Mapping[str, Any]) -> str:

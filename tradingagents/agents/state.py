@@ -53,6 +53,7 @@ class AgentState(MessagesState):
     sentiment_report: Annotated[str, "Report from the Sentiment Analyst"]
     news_report: Annotated[str, "Report from the News Analyst on company and world news"]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Analyst"]
+    intraday_report: Annotated[str, "Report from the Day Trader: intraday levels and a paper plan for one session"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[
@@ -61,6 +62,7 @@ class AgentState(MessagesState):
     investment_plan: Annotated[str, "Investment plan from the Research Manager"]
 
     trader_investment_plan: Annotated[str, "Transaction proposal from the Trader"]
+    trader_proposal: Annotated[dict | None, "The Trader's swing proposal as data (action, entry price, stop loss, sizing); absent when it wrote free text"]
 
     # risk management team discussion step
     risk_debate_state: Annotated[
@@ -68,6 +70,13 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision from the Portfolio Manager"]
     final_rating: Annotated[str, "The Portfolio Manager's 5-tier rating, or REVIEW when it has none"]
+    portfolio_decision: Annotated[dict | None, "The Portfolio Manager's swing decision as data (rating, price target, confidence, ...); absent when it wrote free text"]
     past_context: Annotated[str, "Memory log context for the Portfolio Manager (same-ticker decisions + cross-ticker lessons), written by the Memory Log step"]
     memory_note: Annotated[str, "What the Memory Log step could not settle or read this run, for the report; empty when all went well"]
     portfolio_context: Annotated[str, "Caller-supplied holdings and cash, rendered at run start; empty when not provided"]
+    portfolio_value: Annotated[float | None, "The portfolio's value at the run date (holdings at their last close plus cash) for paper sizing; None without a portfolio or when it cannot be valued in the listing's currency"]
+
+    # intraday (day-trader) mode; absent in a swing run
+    decision_horizon: Annotated[str, "What the run decides: swing (a position rating) or intraday (a paper plan for one session)"]
+    intraday_context: Annotated[dict | None, "Intraday mode: the session the plan is for, its exit-by time and the price the plan is read against, fixed at run start"]
+    intraday_plan: Annotated[dict | None, "Intraday mode: the Portfolio Manager's paper plan as data (direction, entry, stop, target, exit-by, shares, invalidation) with its session, for the memory log"]

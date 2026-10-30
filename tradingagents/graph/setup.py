@@ -11,6 +11,7 @@ from tradingagents.agents import (
     create_bear_researcher,
     create_bull_researcher,
     create_conservative_debator,
+    create_day_trader_analyst,
     create_fundamentals_analyst,
     create_market_analyst,
     create_neutral_debator,
@@ -99,12 +100,15 @@ class GraphSetup:
         deep_thinking_llm: Any,
         conditional_logic: ConditionalLogic,
         max_tool_rounds: int,
+        config: dict | None = None,
     ):
-        """Initialize with required components."""
+        """Initialize with required components; ``config`` decides the analysts' switched tools
+        and the decision horizon (``decision_horizon``)."""
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.conditional_logic = conditional_logic
         self.max_tool_rounds = max_tool_rounds
+        self.config = config or {}
 
     def setup_graph(
         self, selected_analysts=("market", "social", "news", "fundamentals"), memory_node=None
@@ -117,27 +121,33 @@ class GraphSetup:
                 - "social": Sentiment analyst
                 - "news": News analyst
                 - "fundamentals": Fundamentals analyst
+                - "day_trader": Day trader (intraday levels and a paper plan for one session)
             memory_node: Node that settles past decisions and returns the run's
                 ``past_context``. It runs alongside the analysts.
         """
-        plan = build_analyst_execution_plan(selected_analysts)
+        plan = build_analyst_execution_plan(selected_analysts, self.config)
+        # An analyst is offered the tools its node runs, which the config may add to.
+        tools = {spec.key: spec.tools for spec in plan.specs}
 
         analyst_factories = {
             "market": lambda: create_market_analyst(self.quick_thinking_llm),
             "social": lambda: create_sentiment_analyst(self.quick_thinking_llm),
-            "news": lambda: create_news_analyst(self.quick_thinking_llm),
+            "news": lambda: create_news_analyst(self.quick_thinking_llm, tools["news"]),
             "fundamentals": lambda: create_fundamentals_analyst(self.quick_thinking_llm),
+            "day_trader": lambda: create_day_trader_analyst(self.quick_thinking_llm),
         }
+        # An intraday run's Trader and Portfolio Manager write a plan for one session.
+        horizon = self.config.get("decision_horizon") or "swing"
 
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
         bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
         research_manager_node = create_research_manager(self.deep_thinking_llm)
-        trader_node = create_trader(self.quick_thinking_llm)
+        trader_node = create_trader(self.quick_thinking_llm, horizon=horizon)
 
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
-        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm, horizon=horizon)
 
         workflow = StateGraph(AgentState)
 

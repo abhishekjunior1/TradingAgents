@@ -11,6 +11,6 @@ config = DEFAULT_CONFIG.copy()
 # Initialize with custom config
 ta = TradingAgentsGraph(debug=True, config=config)
 
-# forward propagate
-_, decision = ta.propagate("NVDA", "2026-09-01")
+# forward propagate: an NSE listing (RELIANCE.NS), or any Yahoo symbol (NVDA, TCS.BO, ^NSEI)
+_, decision = ta.propagate("RELIANCE.NS", "2026-10-28")
 print(decision)

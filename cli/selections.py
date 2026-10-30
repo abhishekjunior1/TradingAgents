@@ -6,12 +6,14 @@ from pathlib import Path
 
 import typer
 from rich.align import Align
+from rich.markup import escape
 from rich.panel import Panel
 
 from cli import updates
 from cli.display import (
     console,
 )
+from cli.models import AssetType
 from cli.prefs import load_last_run, sanitize, save_last_run
 from cli.prompts import (
     ask_anthropic_effort,
@@ -36,10 +38,14 @@ from cli.prompts import (
     select_llm_provider,
     select_research_depth,
     select_shallow_thinking_agent,
+    shown_url,
 )
+from tradingagents.dataflows import date_window
+from tradingagents.dataflows.symbols import listing_zone, normalize_symbol, resolve_symbol
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.factory import REASONING_EFFORT_PROVIDERS
 from tradingagents.llm_clients.openai_client import check_endpoint
+from tradingagents.markets.exchanges import exchange_for_symbol, session_status
 
 
 def get_user_selections(flags=None):
@@ -55,10 +61,17 @@ def depth_from_env() -> bool:
                 and os.environ.get("TRADINGAGENTS_MAX_RISK_ROUNDS"))
 
 
+def run_horizon(flags) -> str:
+    """The run's decision horizon: --horizon, else TRADINGAGENTS_DECISION_HORIZON's (swing by default)."""
+    return flags.get("horizon") or DEFAULT_CONFIG.get("decision_horizon") or "swing"
+
+
 def unattended_gaps(flags) -> list[str]:
     """The flags and environment variables a run with no terminal still needs."""
     env = os.environ.get
-    gaps = [f"--{name}" for name in ("ticker", "date", "analysts") if flags.get(name) is None]
+    # An intraday plan is for the session at hand, so its date defaults to today.
+    asked = ("ticker", "analysts") if run_horizon(flags) == "intraday" else ("ticker", "date", "analysts")
+    gaps = [f"--{name}" for name in asked if flags.get(name) is None]
     gaps += [f"--{name} or --no-{name}" for name in ("save", "show") if flags.get(name) is None]
     if not env("TRADINGAGENTS_OUTPUT_LANGUAGE"):
         gaps.append("TRADINGAGENTS_OUTPUT_LANGUAGE")
@@ -163,19 +176,25 @@ def _prompt_selections(prefs, flags):
         console.print(create_question_box(box_title, box_body))
         return prompt_fn()
 
-    # Step 1: Ticker symbol
+    # Step 1: Ticker symbol. A bare symbol is listed on the chosen exchange
+    # (--exchange, else TRADINGAGENTS_DEFAULT_EXCHANGE): RELIANCE -> RELIANCE.NS.
+    exchange = flags.get("exchange") or DEFAULT_CONFIG.get("default_exchange")
     if flags.get("ticker") is not None:
-        selected_ticker = _from_flag(parse_ticker, flags["ticker"])
+        selected_ticker = _from_flag(parse_ticker, flags["ticker"], exchange)
         console.print(f"[green]✓ Ticker from --ticker:[/green] {selected_ticker}")
     else:
         console.print(
             create_question_box(
                 "Step 1: Ticker Symbol",
-                "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
+                "Enter the ticker, with exchange suffix when needed "
+                "(e.g. RELIANCE.NS, TCS.BO, NIFTY 50, SPY, 0700.HK, BTC-USD)",
                 "SPY",
             )
         )
-        selected_ticker = get_ticker()
+        selected_ticker = _from_flag(resolve_symbol, get_ticker(), exchange)
+    listing = exchange_for_symbol(selected_ticker)
+    if listing is not None:
+        console.print(f"[green]✓ {listing.name}:[/green] {escape(session_status(listing).describe())}")
     asset_type = detect_asset_type(selected_ticker)
     # Only announce when it's not the default stock path, to avoid printing
     # "stock" on every run.
@@ -183,21 +202,40 @@ def _prompt_selections(prefs, flags):
         console.print(
             f"[green]Detected asset type:[/green] {asset_type.value}"
         )
+    horizon = run_horizon(flags)
+    if horizon == "intraday" and asset_type == AssetType.CRYPTO:
+        console.print("[red]The intraday horizon plans one session of an exchange-listed instrument; crypto "
+                      "trades around the clock, and its sessions are not modelled.[/red]")
+        raise typer.Exit(code=1)
 
-    # Step 2: Analysis date
+    # Step 2: Analysis date. Today is the listing's date when the machine's has moved
+    # past it: in India after midnight, a US ticker's is New York's, whose session
+    # opened the evening before and may still trade.
+    today = date_window.today_for(selected_ticker)
+    whose = "" if today == date_window.get_current_date() else f" in {listing_zone(selected_ticker)}"
     if flags.get("date") is not None:
         analysis_date = _from_flag(parse_analysis_date, flags["date"])
         console.print(f"[green]✓ Analysis date from --date:[/green] {analysis_date}")
+    elif horizon == "intraday":
+        # The plan is for the session at hand; --date names a past one to plan the next session after it.
+        analysis_date = today
+        console.print(f"[green]✓ Analysis date (intraday, today{whose}):[/green] {analysis_date}")
     else:
-        default_date = datetime.datetime.now().strftime("%Y-%m-%d")
         console.print(
             create_question_box(
                 "Step 2: Analysis Date",
                 "Enter the analysis date (YYYY-MM-DD)",
-                default_date,
+                f"{today} (today{whose})" if whose else today,
             )
         )
-        analysis_date = get_analysis_date()
+        analysis_date = get_analysis_date(today)
+    if listing is not None:
+        status = session_status(listing)
+        if analysis_date >= status.local_time.date().isoformat() and not status.session_complete:
+            console.print(
+                f"[yellow]Note: {listing.code}'s session for {analysis_date} is not complete, so its daily bar is "
+                f"intraday or missing; the latest complete session is {status.last_complete_session}.[/yellow]"
+            )
 
     # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
     if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
@@ -259,7 +297,7 @@ def _prompt_selections(prefs, flags):
             selected_llm_provider, env_url=DEFAULT_CONFIG["backend_url"]
         )
         console.print(f"[green]✓ LLM provider from environment:[/green] {selected_llm_provider}")
-        console.print(f"[green]✓ Backend URL:[/green] {backend_url}")
+        console.print(f"[green]✓ Backend URL:[/green] {shown_url(backend_url)}")
     else:
         console.print(
             create_question_box(
@@ -347,7 +385,7 @@ def _prompt_selections(prefs, flags):
             "Reasoning effort", "Step 8: Reasoning Effort",
             "Configure OpenAI reasoning effort level", ask_openai_reasoning_effort,
         )
-    elif provider_lower == "anthropic":
+    elif provider_lower in ("anthropic", "claude_code"):
         anthropic_effort = thinking_value_or_prompt(
             "TRADINGAGENTS_ANTHROPIC_EFFORT", "anthropic_effort",
             "Claude effort", "Step 8: Effort Level",
@@ -368,14 +406,18 @@ def _prompt_selections(prefs, flags):
         "openai_reasoning_effort": reasoning_effort,
         "anthropic_effort": anthropic_effort,
         "output_language": output_language,
+        # --benchmark, --vendor and --horizon apply to this run only; they are not remembered.
+        "benchmark_ticker": normalize_symbol(flags["benchmark"]) if flags.get("benchmark") else None,
+        "data_vendors": flags.get("vendors") or {},
+        "horizon": horizon,
     }
 
 
-def get_analysis_date():
-    """Get the analysis date from user input."""
+def get_analysis_date(default: str | None = None):
+    """Get the analysis date from user input, offering ``default`` (else the machine's date)."""
     while True:
         date_str = typer.prompt(
-            "", default=datetime.datetime.now().strftime("%Y-%m-%d")
+            "", default=default or datetime.datetime.now().strftime("%Y-%m-%d")
         )
         try:
             return parse_analysis_date(date_str)

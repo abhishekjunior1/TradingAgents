@@ -18,6 +18,9 @@ so that:
 
 from __future__ import annotations
 
+import math
+import re
+from datetime import time
 from enum import StrEnum
 from typing import Literal
 
@@ -258,11 +261,41 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    bull_case: str | None = Field(
+        default=None,
+        description="The bullish scenario: what would have to go right and the evidence for it. One to three sentences.",
+    )
+    base_case: str | None = Field(
+        default=None,
+        description="The most likely, neutral scenario and the evidence for it. One to three sentences.",
+    )
+    bear_case: str | None = Field(
+        default=None,
+        description="The bearish scenario: what would go wrong and the evidence for it. One to three sentences.",
+    )
+    key_risks: str | None = Field(
+        default=None,
+        description=(
+            "The main risks to this call, including data the analysis lacked (unavailable, stale "
+            "or delayed figures). One to three sentences."
+        ),
+    )
+    confidence: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description="Confidence in the rating given the evidence and its gaps: low, medium or high.",
+    )
 
     @field_validator("price_target", mode="before")
     @classmethod
     def _nullish_float_to_none(cls, v):
         return _coerce_optional_float(v)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _confidence_word(cls, v):
+        # "Medium" or "MEDIUM" must not fail the whole decision; an unknown word is dropped.
+        word = str(v).strip().lower() if v is not None else None
+        return word if word in ("low", "medium", "high") else None
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
@@ -285,6 +318,262 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     target = decision.price_target if decision.price_target is not None else "not provided"
     parts.extend(["", f"**Price Target**: {target}"])
     parts.extend(["", f"**Time Horizon**: {decision.time_horizon or 'not provided'}"])
+    for label, value in (("Bull Case", decision.bull_case), ("Base Case", decision.base_case),
+                         ("Bear Case", decision.bear_case), ("Key Risks", decision.key_risks),
+                         ("Confidence", decision.confidence)):
+        parts.extend(["", f"**{label}**: {value or 'not provided'}"])
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Intraday (day-trader) mode
+# ---------------------------------------------------------------------------
+#
+# Bound only when decision_horizon is "intraday": the swing schemas, and so what
+# a swing run asks for and renders, are untouched. The plan fields are flat, not
+# a nested object, so every provider's structured-output mode takes them.
+
+# The plan's labelled lines, in the order they are rendered and asked for. The
+# Portfolio Manager's free-text fallback is read back by these labels.
+INTRADAY_PLAN_LABELS = {
+    "direction": "Direction",
+    "entry_price": "Entry Price",
+    "stop_loss": "Stop Loss",
+    "target_price": "Target Price",
+    "exit_by": "Exit By",
+    "position_size_shares": "Position Size (shares)",
+    "invalidation": "Invalidation",
+}
+
+_DIRECTION_WORDS = {
+    "long": "long", "buy": "long", "short": "short", "sell": "short",
+    "none": "none", "no trade": "none", "flat": "none", "hold": "none", "stand aside": "none",
+}
+_CLOCK_RE = re.compile(
+    r"\s*(?P<h>\d{1,2}):(?P<m>\d{2})(?::\d{2})?\s*(?P<ampm>[ap]\.?m\.?)?\s*(?:[a-z]{2,5})?\s*", re.IGNORECASE)
+_RUPEE_PREFIX = re.compile(r"^\s*(?:\u20b9|rs\.?|inr)\s*", re.IGNORECASE)
+
+
+def plan_price(value):
+    """``_coerce_optional_float`` that also reads a rupee price ("\u20b91,405.50", "Rs 1405")."""
+    if isinstance(value, str):
+        value = _RUPEE_PREFIX.sub("", value)
+    return _coerce_optional_float(value)
+
+
+def intraday_direction(value) -> str | None:
+    """long, short or none from the words a model writes for them ("Long", "no-trade", "Sell"); else None.
+
+    Intraday there is no position to exit, so a sell opens a short.
+    """
+    if value is None:
+        return None
+    word = " ".join(str(value).strip().lower().replace("_", " ").replace("-", " ").split())
+    return _DIRECTION_WORDS.get(word)
+
+
+def clock_text(value) -> str | None:
+    """A time of day as HH:MM (24-hour) from "15:10", "15:10 IST" or "3:10 pm"; None when it is not one."""
+    if isinstance(value, time):
+        return f"{value:%H:%M}"
+    if value is None:
+        return None
+    match = _CLOCK_RE.fullmatch(str(value))
+    if not match:
+        return None
+    hour, minute = int(match.group("h")), int(match.group("m"))
+    if match.group("ampm"):
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if match.group("ampm").lower().startswith("p") else 0)
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def whole_shares(value) -> int | None:
+    """A share count from 35, "35" or "1,200 shares"; None for anything else (a fraction, a negative, a range)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip().lower().replace(",", "").removesuffix("shares").removesuffix("share").strip()
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    if not math.isfinite(number) or number < 0 or number != int(number):
+        return None
+    return int(number)
+
+
+_DIRECTION_FIELD = (
+    "The paper trade for the session: long (buy, then sell to close), short (sell first, then buy back; "
+    "intraday only), or none (no trade)."
+)
+_TARGET_FIELD = (
+    "Optional profit target as an absolute price in the instrument's quote currency, on the profitable "
+    "side of the entry. Omit it if you cannot state a level."
+)
+_EXIT_BY_FIELD = (
+    "Optional time to close the position by, as HH:MM in the exchange's time zone, no later than the "
+    "exit-by time the prompt gives."
+)
+_SHARES_FIELD = (
+    "Optional whole number of shares, taken from the intraday snapshot's paper sizing for the chosen "
+    "stop. Omit it rather than estimate one."
+)
+_INVALIDATION_FIELD = (
+    "Optional condition that cancels the plan, before or after the entry: a level broken, a time "
+    "passed, a session the plan should not trade. One sentence."
+)
+
+
+class IntradayTraderProposal(TraderProposal):
+    """The Trader's proposal as a paper plan for one trading session."""
+
+    direction: Literal["long", "short", "none"] | None = Field(default=None, description=_DIRECTION_FIELD)
+    target_price: float | None = Field(default=None, description=_TARGET_FIELD)
+    exit_by: str | None = Field(default=None, description=_EXIT_BY_FIELD)
+    position_size_shares: int | None = Field(default=None, description=_SHARES_FIELD)
+    invalidation: str | None = Field(default=None, description=_INVALIDATION_FIELD)
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _direction_word(cls, v):
+        return intraday_direction(v)
+
+    # Named as the parent's, so it replaces it for the prices of an intraday plan.
+    @field_validator("entry_price", "stop_loss", "target_price", mode="before")
+    @classmethod
+    def _nullish_float_to_none(cls, v):
+        return plan_price(v)
+
+    @field_validator("exit_by", mode="before")
+    @classmethod
+    def _exit_clock(cls, v):
+        return clock_text(v)
+
+    @field_validator("position_size_shares", mode="before")
+    @classmethod
+    def _shares(cls, v):
+        return whole_shares(v)
+
+
+class IntradayPortfolioDecision(PortfolioDecision):
+    """The Portfolio Manager's decision with its paper plan for one trading session."""
+
+    price_target: float | None = Field(
+        default=None,
+        description="Leave empty in an intraday plan: its profit target is target_price.",
+    )
+    direction: Literal["long", "short", "none"] | None = Field(default=None, description=_DIRECTION_FIELD)
+    entry_price: float | None = Field(
+        default=None,
+        description=(
+            "Optional entry trigger as an absolute price in the instrument's quote currency (e.g. 1405.5), "
+            "never a percentage or a range."
+        ),
+    )
+    stop_loss: float | None = Field(
+        default=None,
+        description="Optional stop-loss as an absolute price in the instrument's quote currency, never a percentage.",
+    )
+    target_price: float | None = Field(default=None, description=_TARGET_FIELD)
+    exit_by: str | None = Field(default=None, description=_EXIT_BY_FIELD)
+    position_size_shares: int | None = Field(default=None, description=_SHARES_FIELD)
+    invalidation: str | None = Field(default=None, description=_INVALIDATION_FIELD)
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _direction_word(cls, v):
+        return intraday_direction(v)
+
+    # Named as the parent's, so it replaces it for the prices of an intraday plan.
+    @field_validator("price_target", "entry_price", "stop_loss", "target_price", mode="before")
+    @classmethod
+    def _nullish_float_to_none(cls, v):
+        return plan_price(v)
+
+    @field_validator("exit_by", mode="before")
+    @classmethod
+    def _exit_clock(cls, v):
+        return clock_text(v)
+
+    @field_validator("position_size_shares", mode="before")
+    @classmethod
+    def _shares(cls, v):
+        return whole_shares(v)
+
+
+def intraday_plan_fields(source) -> dict:
+    """The plan fields of an intraday Trader proposal or Portfolio Manager decision, as a dict.
+
+    A decision whose target came only as ``price_target`` keeps it as the target.
+    """
+    fields = {key: getattr(source, key, None) for key in INTRADAY_PLAN_LABELS}
+    if fields["target_price"] is None:
+        fields["target_price"] = getattr(source, "price_target", None)
+    return fields
+
+
+def _plan_lines(fields: dict) -> list[str]:
+    """The plan's labelled lines, each named even when absent."""
+    lines = []
+    for key, label in INTRADAY_PLAN_LABELS.items():
+        value = fields.get(key)
+        lines.extend(["", f"**{label}**: {value if value is not None and value != '' else 'not provided'}"])
+    return lines
+
+
+def plan_checks_line(notes) -> str | None:
+    """The decision's line on what the stored plan changed or noted ("**Plan Checks**: ..."); None without notes."""
+    return f"**Plan Checks**: {'; '.join(notes)}." if notes else None
+
+
+def render_intraday_trader_proposal(proposal: IntradayTraderProposal) -> str:
+    """Render an intraday proposal: the swing proposal's lines, the plan's, then the closing proposal line."""
+    parts = [
+        f"**Action**: {proposal.action.value}",
+        "",
+        f"**Reasoning**: {proposal.reasoning}",
+        *_plan_lines(intraday_plan_fields(proposal)),
+        "",
+        f"**Position Sizing**: {proposal.position_sizing or 'not provided'}",
+        "",
+        f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
+    ]
+    return "\n".join(parts)
+
+
+def render_intraday_pm_decision(decision: IntradayPortfolioDecision, session: str | None = None,
+                                plan: dict | None = None) -> str:
+    """Render an intraday decision: the rating first, as in swing, then the paper plan and the scenarios.
+
+    ``session`` names the session the plan is for, from the run; the plan's
+    target stands in for the swing price target. ``plan`` is the plan as stored
+    and scored (``intraday_plan.plan_from_fields``): the report then shows the
+    exit-by that is scored, and the plan's notes as a "Plan Checks" line.
+    """
+    parts = [
+        f"**Rating**: {decision.rating.value}",
+        "",
+        f"**Executive Summary**: {decision.executive_summary}",
+        "",
+        f"**Investment Thesis**: {decision.investment_thesis}",
+    ]
+    if session:
+        parts.extend(["", f"**Plan Session**: {session}"])
+    parts.extend(_plan_lines(plan if plan is not None else intraday_plan_fields(decision)))
+    checks = plan_checks_line((plan or {}).get("notes"))
+    if checks:
+        parts.extend(["", checks])
+    parts.extend(["", f"**Time Horizon**: {decision.time_horizon or 'intraday, one session'}"])
+    for label, value in (("Bull Case", decision.bull_case), ("Base Case", decision.base_case),
+                         ("Bear Case", decision.bear_case), ("Key Risks", decision.key_risks),
+                         ("Confidence", decision.confidence)):
+        parts.extend(["", f"**{label}**: {value or 'not provided'}"])
     return "\n".join(parts)
 
 

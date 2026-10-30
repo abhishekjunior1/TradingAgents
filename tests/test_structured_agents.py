@@ -231,6 +231,10 @@ class TestTraderAgent:
         assert "FINAL TRANSACTION PROPOSAL: **BUY**" in plan
         # The same rendered markdown is also added to messages for downstream agents.
         assert plan in result["messages"][0].content
+        # The proposal is kept as data too, so its stop is never read back from the text.
+        assert result["trader_proposal"] == {"action": "Buy", "reasoning": proposal.reasoning,
+                                             "entry_price": 189.5, "stop_loss": 178.0,
+                                             "position_sizing": "6% of portfolio"}
 
     def test_prompt_includes_investment_plan(self):
         captured = {}
@@ -277,6 +281,7 @@ class TestTraderAgent:
         trader = create_trader(llm)
         result = trader(_make_trader_state())
         assert result["trader_investment_plan"] == plain_response
+        assert "trader_proposal" not in result
 
 
 # ---------------------------------------------------------------------------

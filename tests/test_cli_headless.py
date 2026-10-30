@@ -141,7 +141,8 @@ def test_the_command_passes_its_flags_to_the_run(monkeypatch):
                                                "--analysts", "market,news", "--save", "--no-show"])
 
     assert result.exit_code == 0, result.output
-    assert seen["flags"] == {**FLAGS, "html": None}
+    assert seen["flags"] == {**FLAGS, "html": None, "exchange": None, "benchmark": None, "vendors": {},
+                             "horizon": None, "arena": None, "arena_yes": False}
 
 
 @pytest.mark.unit
@@ -213,6 +214,36 @@ def test_each_tier_provider_s_key_is_checked_before_the_run(monkeypatch):
     selections._prompt_selections({}, FLAGS)
 
     assert checked == ["openai", "anthropic"]
+
+
+@pytest.mark.unit
+def test_the_backend_url_is_shown_without_its_credentials(monkeypatch, capsys):
+    """A headless run's output is kept in logs, and the /day-trader skill shows its end
+    to Claude; the run itself still gets the whole URL."""
+    _selections_with_env(monkeypatch)
+    url = "https://reviewer:FAKE-secret-0000@llm.example.invalid/v1?api-key=FAKE-key-1111"
+    monkeypatch.setitem(selections.DEFAULT_CONFIG, "backend_url", url)
+
+    chosen = selections._prompt_selections({}, FLAGS)
+
+    out = capsys.readouterr().out
+    assert "✓ Backend URL: https://***@llm.example.invalid/v1?***" in out
+    assert "FAKE" not in out and chosen["backend_url"] == url
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("url, shown", [
+    ("https://api.openai.com/v1", "https://api.openai.com/v1"),
+    ("http://localhost:11434/v1", "http://localhost:11434/v1"),
+    ("https://token@llm.example.invalid/v1", "https://***@llm.example.invalid/v1"),
+    ("https://user:p%40ss@llm.example.invalid:8443/v1", "https://***@llm.example.invalid:8443/v1"),
+    ("user:pass@llm.example.invalid/v1", "***@llm.example.invalid/v1"),
+    ("https://llm.example.invalid/v1?key=abc", "https://llm.example.invalid/v1?***"),
+    ("https://llm.example.invalid/v1?email=a@b.example", "https://llm.example.invalid/v1?***"),
+    (None, None),
+])
+def test_a_shown_url_hides_a_user_name_password_and_query(url, shown):
+    assert prompts.shown_url(url) == shown
 
 
 def _report_graph(tmp_path):

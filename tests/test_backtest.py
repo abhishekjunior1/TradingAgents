@@ -8,6 +8,9 @@ simulate a portfolio, so there is no execution, no fees and no equity curve.
 
 from __future__ import annotations
 
+import copy
+import logging
+
 import pytest
 
 from tradingagents.backtest import iter_grid, run_backtest, summarize
@@ -112,6 +115,58 @@ def test_a_failed_cell_does_not_abort_the_sweep(tmp_path):
 
     assert result.cells_run == 1
     assert result.failures == [("NVDA", "2026-01-05", "vendor exploded")]
+
+
+@pytest.mark.unit
+def test_a_backtest_never_reads_news_through_agent_reach(tmp_path, caplog):
+    """Its web search has no date filter and pages give their own dates, so past cells
+    would read thin or misdated news, and a sweep would hit Exa's anonymous limit."""
+    config = {**_config(tmp_path), "agent_reach_enabled": True,
+              "data_vendors": {"core_stock_apis": "yfinance", "news_data": "agent_reach,yfinance",
+                               "web_research": "agent_reach"},
+              "tool_vendors": {"get_news": "agent_reach", "get_global_news": "agent_reach,alpha_vantage",
+                               "get_stock_data": "alpha_vantage"}}
+    asked = copy.deepcopy(config)
+
+    with caplog.at_level(logging.WARNING, logger="tradingagents.backtest"):
+        run_backtest(["NVDA"], ["2026-01-05", "2026-01-12"], config)
+
+    built = _FakeGraph.instances[-1].config
+    assert built["agent_reach_enabled"] is False
+    assert built["data_vendors"]["news_data"] == "yfinance" and built["data_vendors"]["core_stock_apis"] == "yfinance"
+    assert built["data_vendors"]["web_research"] == "default"     # its only vendor is Agent-Reach, now off
+    assert built["tool_vendors"] == {"get_news": "yfinance", "get_global_news": "alpha_vantage",
+                                     "get_stock_data": "alpha_vantage"}
+    assert config == asked                                          # the caller's config is not changed
+    said = [record.getMessage() for record in caplog.records if "Agent-Reach" in record.getMessage()]
+    assert len(said) == 1 and said[0].endswith("news comes from yfinance.")
+
+
+@pytest.mark.unit
+def test_a_news_chain_the_environment_switched_to_agent_reach_is_switched_back(tmp_path, monkeypatch):
+    import tradingagents.default_config as default_config
+
+    switched = copy.deepcopy(default_config.DEFAULT_CONFIG)
+    switched["agent_reach_enabled"] = True
+    switched["data_vendors"]["news_data"] = "agent_reach,yfinance"
+    monkeypatch.setattr(default_config, "DEFAULT_CONFIG", switched)
+
+    run_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path))          # a config that names no vendors
+
+    built = _FakeGraph.instances[-1].config
+    assert built["agent_reach_enabled"] is False and built["data_vendors"]["news_data"] == "yfinance"
+
+
+@pytest.mark.unit
+def test_a_backtest_without_agent_reach_keeps_its_vendors_and_says_nothing(tmp_path, caplog):
+    config = {**_config(tmp_path), "data_vendors": {"news_data": "yfinance,alpha_vantage"}}
+
+    with caplog.at_level(logging.WARNING, logger="tradingagents.backtest"):
+        run_backtest(["NVDA"], ["2026-01-05"], config)
+
+    built = _FakeGraph.instances[-1].config
+    assert built["data_vendors"] == {"news_data": "yfinance,alpha_vantage"} and "tool_vendors" not in built
+    assert built["agent_reach_enabled"] is False and not caplog.records
 
 
 # --- reading the result ------------------------------------------------------

@@ -87,6 +87,19 @@ MACRO_SERIES = {
     "germany_10y": "IRLTLT01DEM156N",
     "france_10y": "IRLTLT01FRM156N",
     "eur_usd": "DEXUSEU",
+    # India, as FRED mirrors it (checked 2026-10-29: each still updated). FRED has
+    # no current RBI repo-rate or monthly CPI series for India (the OECD CPI and
+    # central-bank-rate series stopped in 2025 and 2023), so neither is aliased:
+    # the call-money and 3-month interbank rates track policy most closely.
+    "usd_inr": "DEXINUS",               # INR per USD, daily (Fed H.10)
+    "inr_usd": "DEXINUS",
+    "india_10y": "INDIRLTLT01STM",      # 10-year government bond yield, monthly (OECD)
+    "india_call_rate": "IRSTCI01INM156N",   # call money / interbank overnight, monthly (OECD)
+    "india_3m_interbank": "INDIR3TIB01STM",  # 3-month interbank rate, monthly (OECD)
+    "india_gdp_growth": "INDGDPRQPSMEI",    # real GDP growth, % y/y, quarterly (OECD)
+    "india_real_gdp": "NGDPRNSAXDCINQ",     # real GDP, INR millions, quarterly NSA (IMF)
+    "india_industrial_production": "INDPRINTO01GYSAM",  # % y/y, monthly (OECD)
+    "india_cpi_annual": "FPCPITOTLZGIND",   # CPI inflation, % a year, annual only (World Bank)
 }
 
 

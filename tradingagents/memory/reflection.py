@@ -61,3 +61,40 @@ class Reflector:
             ),
         ]
         return self.quick_thinking_llm.invoke(messages).content
+
+    @staticmethod
+    def _intraday_system_prompt() -> str:
+        """The intraday variant: a paper plan for one session, replayed on that session's bars.
+
+        The replay's rules are named because they bound what the outcome shows: a
+        plan stopped in a bar that also reached its target may not have been, and
+        one session says little about a setup's edge.
+        """
+        return (
+            "You are a day trader reviewing your own paper plan for one trading session now that the session "
+            "has closed.\n"
+            "The outcome replays the plan on that session's 5-minute bars: an order fills only when a bar reaches "
+            "its price, a bar that reaches both the stop and the target counts as stopped, charges are estimates, "
+            "and it covers that one session only.\n"
+            "Write exactly 2-4 sentences of plain prose (no bullets, no headers, no markdown).\n\n"
+            "Cover in order:\n"
+            "1. What the plan did in the session (filled or not, how it exited, the net result and R multiple; "
+            "cite the figures), judged against the session's range.\n"
+            "2. Which part of the plan (direction, entry trigger, stop, target, timing) the session supports or "
+            "undercuts, and say so plainly if one session is too little to judge the setup.\n"
+            "3. One concrete lesson to apply to the next intraday plan.\n\n"
+            "Be specific and terse. Your output will be stored verbatim in a memory log "
+            "and re-read by future analysts, so every word must earn its place."
+        )
+
+    def reflect_on_intraday_plan(self, final_decision: str, outcome_summary: str) -> str:
+        """Single reflection call on a settled intraday plan.
+
+        ``outcome_summary`` is the plan, what its replay on the session's bars did
+        and the session's range, as the settlement writes them.
+        """
+        messages = [
+            ("system", self._intraday_system_prompt()),
+            ("human", f"{outcome_summary}\n\nFinal Decision:\n{final_decision}"),
+        ]
+        return self.quick_thinking_llm.invoke(messages).content

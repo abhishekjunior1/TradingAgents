@@ -1,4 +1,5 @@
-"""Symbol normalization for vendor calls, and ticker values safe to use in a path.
+"""Symbol normalization for vendor calls, the clock a listing's day is read on, and
+ticker values safe to use in a path.
 
 Yahoo Finance (the default vendor) uses specific ticker conventions that
 differ from the broker / TradingView / MT5 style symbols users often type:
@@ -12,6 +13,16 @@ differ from the broker / TradingView / MT5 style symbols users often type:
     SPX500, US500     ^GSPC             index CFDs map to Yahoo index symbols
     09992.HK, 700.HK  9992.HK, 0700.HK  HK codes are zero-padded to 4 digits
     600519.SH         600519.SS         Yahoo spells Shanghai ``.SS``
+    NSE:RELIANCE,     RELIANCE.NS       NSE listings take ``.NS``; brokers,
+      RELIANCE.NSE,                     TradingView and data vendors spell
+      RELIANCE-EQ                       the exchange other ways
+    BSE:RELIANCE      RELIANCE.BO       BSE listings take ``.BO`` (by symbol;
+                                        Yahoo serves no BSE scrip codes)
+    NIFTY, BANKNIFTY  ^NSEI, ^NSEBANK   Indian index names map to Yahoo's
+                                        index symbols (``markets.india``)
+
+A bare symbol (``RELIANCE``) names no market; ``resolve_symbol`` gives it the
+listing suffix of a default exchange the caller chose.
 
 Passing the raw broker symbol to Yahoo returns an empty result, which the
 agents previously received as free text and could hallucinate a price
@@ -24,8 +35,14 @@ from __future__ import annotations
 
 import logging
 import re
+from zoneinfo import ZoneInfo
+
+from tradingagents.markets.exchanges import exchange_for_symbol
+from tradingagents.markets.india import index_for
 
 logger = logging.getLogger(__name__)
+
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 # ISO-4217 codes common enough to appear in retail forex pairs. A bare
@@ -71,6 +88,31 @@ _ALIASES = {
 _HK_CODE = re.compile(r"^(\d{1,5})\.HK$")
 _SHANGHAI_SH = re.compile(r"^(\d{6})\.SH$")
 
+# Indian listings as brokers, TradingView and data vendors write them. NSE's
+# "EQ" series is its ordinary equity segment.
+_EXCHANGE_PREFIX = re.compile(r"^(NSE|BSE|BOM)\s*:\s*(\S.*)$")
+_VENDOR_SUFFIX = {".NSE": ".NS", ".BSE": ".BO"}
+_NSE_EQ_SERIES = re.compile(r"^([A-Z0-9&\-]+)-EQ$")
+# A symbol that names no market: no suffix, index caret, future or pair marker.
+_BARE = re.compile(r"^[A-Z0-9][A-Z0-9&\-]*$")
+_BSE_SCRIP_CODE = re.compile(r"^\d{6}(\.BO)?$")
+
+
+def _indian_listing(s: str) -> str:
+    """``NSE:RELIANCE``, ``RELIANCE.NSE``, ``RELIANCE-EQ`` -> ``RELIANCE.NS``; ``BSE:``/``BOM:`` -> ``.BO``."""
+    if prefixed := _EXCHANGE_PREFIX.match(s):
+        venue, symbol = prefixed.groups()
+        index = index_for(symbol)
+        if index is not None:
+            return index.symbol
+        return symbol.strip() + (".NS" if venue == "NSE" else ".BO")
+    for vendor, yahoo in _VENDOR_SUFFIX.items():
+        if s.endswith(vendor):
+            return s[: -len(vendor)] + yahoo
+    if series := _NSE_EQ_SERIES.match(s):
+        return series.group(1) + ".NS"
+    return s
+
 
 # Crypto quote currencies that all map to Yahoo's USD pair. Yahoo lists only
 # ``<BASE>-USD`` (not the USDT/USDC stablecoin pairs), so a broker symbol quoted
@@ -100,6 +142,29 @@ def _normalize_crypto(s: str) -> str | None:
     return f"{base}-USD" if base else None
 
 
+def is_us_listing(symbol: str) -> bool:
+    """Whether a canonical Yahoo symbol is a plain US listing: one that names no
+    market (no suffix, index caret, future or pair marker) and is not a crypto
+    pair. Yahoo lists such symbols on US exchanges."""
+    return isinstance(symbol, str) and bool(_BARE.fullmatch(symbol)) and crypto_base(symbol) is None
+
+
+def listing_zone(symbol: str | None) -> ZoneInfo | None:
+    """The time zone whose date is "today" for a listing: an NSE/BSE listing's or
+    index's exchange zone, New York's for a plain US listing, else None (the
+    machine's own date: futures, forex, crypto, and other markets' listings and indices).
+
+    ``symbol`` is read as ``normalize_symbol`` reads it, so ``NSE:RELIANCE`` is India's.
+    """
+    canonical = normalize_symbol(symbol) if isinstance(symbol, str) else None
+    if not canonical:
+        return None
+    exchange = exchange_for_symbol(canonical)
+    if exchange is not None:
+        return exchange.tz
+    return NEW_YORK if is_us_listing(canonical) else None
+
+
 def normalize_symbol(raw: str) -> str:
     """Map a user/broker symbol to its canonical Yahoo Finance symbol.
 
@@ -111,7 +176,10 @@ def normalize_symbol(raw: str) -> str:
       4. HK rule: a numeric ``.HK`` code -> Yahoo's 4-digit padding
          (``09992.HK`` -> ``9992.HK``, ``700.HK`` -> ``0700.HK``).
       5. Shanghai rule: ``600519.SH`` -> ``600519.SS``.
-      6. Otherwise the upper-cased symbol is returned unchanged (plain
+      6. Indian rules: exchange-prefixed and vendor-suffixed listings
+         (``NSE:RELIANCE``, ``RELIANCE.BSE``) take Yahoo's suffix, and Indian
+         index names (``NIFTY 50``, ``BANKNIFTY``) their Yahoo index symbol.
+      7. Otherwise the upper-cased symbol is returned unchanged (plain
          equities, ETFs, Yahoo-native symbols like ``GC=F`` or ``^GSPC``).
 
     A trailing ``+`` (broker CFD marker, e.g. ``XAUUSD+``) is stripped before
@@ -124,10 +192,14 @@ def normalize_symbol(raw: str) -> str:
     s = raw.strip().upper()
     # Broker CFD/qualifier suffixes Yahoo never uses.
     s = s.rstrip("+")
+    s = _indian_listing(s)
 
     crypto = _normalize_crypto(s)
+    index = index_for(s)
     if s in _ALIASES:
         canonical = _ALIASES[s]
+    elif index is not None:
+        canonical = index.symbol
     elif crypto is not None:
         canonical = crypto
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
@@ -144,12 +216,36 @@ def normalize_symbol(raw: str) -> str:
     return canonical
 
 
+def resolve_symbol(raw: str, default_exchange: str | None = None) -> str:
+    """``normalize_symbol``, with a bare equity symbol listed on ``default_exchange``.
+
+    ``RELIANCE`` with ``NSE`` is ``RELIANCE.NS``. A symbol that already names its
+    market (a suffix, an index, a future, a forex or crypto pair) is left as it
+    is. BSE scrip codes (``500325``) are refused with the fix: Yahoo Finance
+    serves BSE listings by symbol (``RELIANCE.BO``) and returns nothing for a code.
+    """
+    from tradingagents.markets.exchanges import get_exchange
+
+    canonical = normalize_symbol(raw)
+    if not isinstance(canonical, str) or not canonical:
+        return canonical
+    exchange = get_exchange(default_exchange)
+    if _BSE_SCRIP_CODE.fullmatch(canonical) and (exchange is not None or canonical.endswith(".BO")):
+        raise ValueError(
+            f"{raw!r} looks like a BSE scrip code; Yahoo Finance has no data for those. "
+            "Use the trading symbol with its exchange, e.g. RELIANCE.BO or RELIANCE.NS."
+        )
+    if exchange is None or not _BARE.fullmatch(canonical) or crypto_base(canonical):
+        return canonical
+    return canonical + exchange.suffix
+
+
 # Tickers can contain letters, digits, dot, dash, underscore, caret
-# (index symbols like ^GSPC), equals (futures like GC=F), and plus
-# (forex/CFD symbols like XAUUSD+). None of these enable directory
-# traversal, so the value never escapes a containing directory when
-# interpolated into a path. Anything else is rejected.
-_TICKER_PATH_RE = re.compile(r"^[A-Za-z0-9._\-\^=+]+$")
+# (index symbols like ^GSPC), equals (futures like GC=F), plus
+# (forex/CFD symbols like XAUUSD+) and ampersand (NSE listings like M&M.NS).
+# None of these enable directory traversal, so the value never escapes a
+# containing directory when interpolated into a path. Anything else is rejected.
+_TICKER_PATH_RE = re.compile(r"^[A-Za-z0-9._\-\^=+&]+$")
 
 
 def safe_ticker_component(value: str, *, max_len: int = 32) -> str:

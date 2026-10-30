@@ -5,13 +5,24 @@ from typing import Annotated
 import typer
 from rich.markup import escape
 
+from cli.arena import app as arena_app
 from cli.display import console
-from cli.models import AnalystType, AssetType
-from cli.prompts import filter_analysts_for_asset_type, parse_analysts
+from cli.models import AssetType
+from cli.prompts import (
+    DEFAULT_ANALYSTS,
+    filter_analysts_for_asset_type,
+    parse_analysts,
+    parse_horizon,
+    parse_vendors,
+)
 from cli.run import run_analysis
 from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.dataflows.symbols import resolve_symbol
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_clients.claude_code_client import ClaudeCodeError
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
+from tradingagents.markets.exchanges import get_exchange
+from tradingagents.markets.watchlists import watchlist_symbols
 from tradingagents.portfolio import load_portfolio
 
 # prompt_toolkit's win32 output module is importable only on Windows (it asserts
@@ -68,6 +79,36 @@ def analyze(
         None, "--html/--no-html",
         help="Save the report as one HTML page too, complete_report.html, without asking (default: yes)",
     ),
+    exchange: str = typer.Option(
+        None, "--exchange",
+        help="nse or bse: a bare ticker (RELIANCE) is read as that exchange's listing (RELIANCE.NS). "
+        "Omit to honor TRADINGAGENTS_DEFAULT_EXCHANGE.",
+    ),
+    benchmark: str = typer.Option(
+        None, "--benchmark",
+        help="Index the decision is measured against, e.g. NIFTY 50, BANKNIFTY or ^NSEI "
+        "(default: the exchange's headline index)",
+    ),
+    vendor: Annotated[list[str] | None, typer.Option(
+        "--vendor",
+        help="Data vendor for a category for this run, as category=vendor, e.g. "
+        "core_stock_apis=alpha_vantage; repeatable",
+    )] = None,
+    horizon: str = typer.Option(
+        None, "--horizon",
+        help="swing (a position rating) or intraday (a paper plan for one session, with the Day Trader "
+        "analyst; the date defaults to today). Omit to honor TRADINGAGENTS_DECISION_HORIZON.",
+    ),
+    arena: bool | None = typer.Option(
+        None, "--arena/--no-arena",
+        help="Offer the decision to AlphArena as a paper trade with simulated money, after the run and "
+        "once you confirm: swing decisions on US stocks and ETFs dated today in New York only "
+        "(docs/arena.md). Omit to honor TRADINGAGENTS_ARENA.",
+    ),
+    arena_yes: bool = typer.Option(
+        False, "--arena-yes",
+        help="Send that AlphArena paper trade without asking, e.g. with no terminal",
+    ),
 ):
     """Run an analysis. This is what a bare `tradingagents` does.
 
@@ -76,6 +117,13 @@ def analyze(
     """
     if ctx.invoked_subcommand is not None:
         return
+    try:
+        listing = get_exchange(exchange or DEFAULT_CONFIG.get("default_exchange"))
+        vendors = parse_vendors(vendor)
+        horizon = parse_horizon(horizon)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
@@ -83,13 +131,15 @@ def analyze(
     portfolio_context = None
     if portfolio:
         try:
-            portfolio_context = load_portfolio(portfolio)
+            portfolio_context = load_portfolio(portfolio, listing.code if listing else None)
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=1) from None
 
     try:
-        flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html}
+        flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html,
+                 "exchange": listing.code if listing else None, "benchmark": benchmark, "vendors": vendors,
+                 "horizon": horizon, "arena": arena, "arena_yes": arena_yes}
         run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
     except _NO_CONSOLE_ERRORS:
         # A terminal with no console buffer cannot host the interactive prompts.
@@ -102,16 +152,22 @@ def analyze(
             err=True,
         )
         raise typer.Exit(code=1) from None
+    except ClaudeCodeError as exc:
+        # Claude Code's message names what to fix (the model, the sign-in, the
+        # plan's limit); a traceback through the graph adds nothing to it.
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
 
 
 @app.command()
 def backtest(
-    tickers: str = typer.Argument(..., help="Comma-separated tickers, e.g. NVDA,AAPL"),
+    tickers: str = typer.Argument(None, help="Comma-separated tickers, e.g. NVDA,AAPL or RELIANCE.NS,TCS.NS"),
     start: str = typer.Option(..., "--start", help="First analysis date, YYYY-MM-DD"),
     end: str = typer.Option(..., "--end", help="Last analysis date, YYYY-MM-DD"),
     every: int = typer.Option(7, "--every", help="Days between analysis dates"),
     analysts: str = typer.Option(
-        None, "--analysts", help="Comma-separated analysts to run: market, sentiment, news, fundamentals; omit for all the asset type allows"
+        None, "--analysts", help="Comma-separated analysts to run: market, sentiment, news, fundamentals, day_trader; "
+        "omit for all the asset type allows but day_trader"
     ),
     asset_type: str = typer.Option("stock", "--asset-type", help="stock or crypto"),
     portfolio: str = typer.Option(
@@ -120,24 +176,35 @@ def backtest(
     run_id: str = typer.Option(
         None, "--run-id", help="Continue an earlier sweep: its cells are skipped and its log reused"
     ),
+    exchange: str = typer.Option(
+        None, "--exchange", help="nse or bse: bare tickers are read as that exchange's listings"
+    ),
+    watchlist: str = typer.Option(
+        None, "--watchlist", help="Sweep a named watchlist (see TRADINGAGENTS_WATCHLISTS_FILE) instead of TICKERS"
+    ),
 ):
     """Score past decisions over a grid of tickers and dates."""
 
     try:
         dates = iter_grid(start, end, every)
-        book = load_portfolio(portfolio) if portfolio else None
+        listing = get_exchange(exchange or DEFAULT_CONFIG.get("default_exchange"))
+        code = listing.code if listing else None
+        book = load_portfolio(portfolio, code) if portfolio else None
         kind = AssetType(asset_type.strip().lower())
         # The analysts are named and checked as for an analysis; without a
-        # choice, every analyst the asset type allows runs.
+        # choice, every analyst the asset type allows runs, but the Day Trader.
         chosen = (parse_analysts(analysts, kind) if analysts
-                  else filter_analysts_for_asset_type(list(AnalystType), kind))
+                  else filter_analysts_for_asset_type(list(DEFAULT_ANALYSTS), kind))
+        if watchlist:
+            names = watchlist_symbols(watchlist, DEFAULT_CONFIG, lambda s: resolve_symbol(s, code))
+        else:
+            names = [resolve_symbol(t.strip(), code) for t in (tickers or "").split(",") if t.strip()]
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from None
 
-    names = [t.strip() for t in tickers.split(",") if t.strip()]
     if not names:
-        console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL[/red]")
+        console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL, or --watchlist[/red]")
         raise typer.Exit(code=1)
 
     def show_progress(done, total, ticker, date):
@@ -158,6 +225,29 @@ def backtest(
         console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
     for ticker, reason in result.settlement_failures:
         console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+
+
+@app.command()
+def market(
+    exchange: str = typer.Option("nse", "--exchange", help="nse or bse"),
+    watchlist: str = typer.Option(
+        None, "--watchlist", help="A named watchlist (see TRADINGAGENTS_WATCHLISTS_FILE) or comma-separated symbols"
+    ),
+    date: str = typer.Option(None, "--date", help="As-of date, YYYY-MM-DD (default: today in the exchange's time zone)"),
+):
+    """Show an Indian exchange's session (IST) and its indices, India VIX, the rupee and crude; no model is called."""
+    from cli.market import show_market
+
+    try:
+        listing = get_exchange(exchange)
+        show_market(listing, watchlist, date)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+
+
+# `tradingagents arena status|leaderboard|trades|close`: AlphArena paper trading (cli/arena.py).
+app.add_typer(arena_app, name="arena")
 
 
 # The plans `login` and `logout` take: the providers signed in to, not keyed.

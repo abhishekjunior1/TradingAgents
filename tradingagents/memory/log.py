@@ -1,6 +1,12 @@
-"""The memory log: an append-only markdown record of each decision and, once settled, its outcome."""
+"""The memory log: an append-only markdown record of each decision and, once settled, its outcome.
+
+An intraday decision carries its paper plan as one JSON line under a
+``HORIZON: intraday`` line, between the tag and the decision, and its outcome
+joins them once the session has been scored; the tag grammar is the same.
+"""
 
 import contextlib
+import json
 import re
 from pathlib import Path
 
@@ -16,6 +22,10 @@ class TradingMemoryLog:
     # Precompiled patterns — avoids re-compilation on every load_entries() call
     _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
     _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+    # An intraday entry's labelled lines, before its DECISION section.
+    INTRADAY_TAG = "HORIZON: intraday"
+    _PLAN_LABEL = "INTRADAY PLAN: "
+    _OUTCOME_LABEL = "INTRADAY OUTCOME: "
 
     def __init__(self, config: dict = None):
         cfg = config or {}
@@ -35,11 +45,14 @@ class TradingMemoryLog:
         trade_date: str,
         final_trade_decision: str,
         rating: str | None = None,
+        intraday_plan: dict | None = None,
     ) -> None:
         """Append pending entry at end of propagate(). No LLM call.
 
         ``rating`` is the decision's own rating when the caller has it; without
-        one it is read from the decision text.
+        one it is read from the decision text. ``intraday_plan`` (an intraday
+        run's plan, ``{}`` when it gave none) tags the entry intraday, so it is
+        settled on its session's bars rather than over the holding period.
         """
         if not self._log_path:
             return
@@ -55,7 +68,10 @@ class TradingMemoryLog:
                         return
             rating = rating or parse_rating(final_trade_decision)
             tag = f"[{trade_date} | {ticker} | {rating} | pending]"
-            entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
+            head = ""
+            if intraday_plan is not None:
+                head = f"{self.INTRADAY_TAG}\n{self._PLAN_LABEL}{_json_line(intraday_plan)}\n\n"
+            entry = f"{tag}\n\n{head}DECISION:\n{final_trade_decision}{self._SEPARATOR}"
             with open(self._log_path, "a", encoding="utf-8") as f:
                 f.write(entry)
 
@@ -203,6 +219,52 @@ class TradingMemoryLog:
             tmp_path.replace(self._log_path)
             return True
 
+    def update_with_intraday_outcome(
+        self,
+        ticker: str,
+        trade_date: str,
+        outcome: dict,
+        reflection: str,
+        resolution_date: str | None = None,
+    ) -> bool:
+        """Settle an intraday entry: its tag names the plan's net return, and its outcome and reflection join it.
+
+        The tag reads ``[date | ticker | rating | net | n/a | intraday |
+        resolved:session]``: the net return as a percentage of the position's
+        value at entry ("n/a" with no trade), no alpha (there is no benchmark
+        for one session), and the session the outcome became known. Returns
+        whether an entry was updated, as ``update_with_outcome`` does.
+        """
+        if not self._log_path or not self._log_path.exists():
+            return False
+        net = outcome.get("net_return_pct")
+        raw_pct = f"{net / 100:+.1%}" if isinstance(net, (int, float)) else "n/a"
+        with locked(self._log_path):
+            text = self._log_path.read_text(encoding="utf-8")
+            blocks = text.split(self._SEPARATOR)
+            pending_prefix = f"[{trade_date} | {ticker} |"
+            for index, block in enumerate(blocks):
+                lines = block.strip().splitlines()
+                if not lines:
+                    continue
+                tag_line = lines[0].strip()
+                if not (tag_line.startswith(pending_prefix) and tag_line.endswith("| pending]")):
+                    continue
+                rating = [f.strip() for f in tag_line[1:-1].split("|")][2]
+                tag = f"[{trade_date} | {ticker} | {rating} | {raw_pct} | n/a | intraday"
+                tag += f" | resolved:{resolution_date}]" if resolution_date else "]"
+                head, sep, rest = "\n".join(lines[1:]).lstrip().partition("\n\nDECISION:\n")
+                body = f"{head}\n{self._OUTCOME_LABEL}{_json_line(outcome)}{sep}{rest}"
+                blocks[index] = f"{tag}\n\n{body}\n\nREFLECTION:\n{reflection}"
+                break
+            else:
+                return False
+            new_blocks = self._apply_rotation(blocks)
+            tmp_path = self._log_path.with_suffix(".tmp")
+            tmp_path.write_text(self._SEPARATOR.join(new_blocks), encoding="utf-8")
+            tmp_path.replace(self._log_path)
+            return True
+
     def batch_update_with_outcomes(self, updates: list[dict]) -> None:
         """Apply multiple outcome updates in a single read + atomic write.
 
@@ -339,6 +401,12 @@ class TradingMemoryLog:
         reflection_match = self._REFLECTION_RE.search(body)
         entry["decision"] = decision_match.group(1).strip() if decision_match else ""
         entry["reflection"] = reflection_match.group(1).strip() if reflection_match else ""
+        # The labelled lines before the decision; the decision's own text is never read for them.
+        head = body.split("DECISION:\n", 1)[0] if "DECISION:\n" in body else ""
+        if self.INTRADAY_TAG in head.splitlines():
+            entry["horizon"] = "intraday"
+            entry["intraday_plan"] = _labelled_json(head, self._PLAN_LABEL)
+            entry["intraday_outcome"] = _labelled_json(head, self._OUTCOME_LABEL)
         return entry
 
     def _format_full(self, e: dict) -> str:
@@ -346,15 +414,67 @@ class TradingMemoryLog:
         alpha = e["alpha"] or "n/a"
         holding = e["holding"] or "n/a"
         tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw} | {alpha} | {holding}]"
-        parts = [tag, f"DECISION:\n{e['decision']}"]
+        parts = [tag]
+        if e.get("horizon") == "intraday":
+            parts.append(f"INTRADAY OUTCOME: {describe_outcome(e.get('intraday_plan'), e.get('intraday_outcome'))}")
+        parts.append(f"DECISION:\n{e['decision']}")
         if e["reflection"]:
             parts.append(f"REFLECTION:\n{e['reflection']}")
         return "\n\n".join(parts)
 
     def _format_reflection_only(self, e: dict) -> str:
-        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}]"
+        horizon = " | intraday" if e.get("horizon") == "intraday" else ""
+        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}{horizon}]"
         if e["reflection"]:
             return f"{tag}\n{e['reflection']}"
         text = e["decision"][:300]
         suffix = "..." if len(e["decision"]) > 300 else ""
         return f"{tag}\n{text}{suffix}"
+
+
+# Line breaks str.splitlines() reads that JSON leaves unescaped outside ASCII.
+_UNESCAPED_BREAKS = {0x85: "\\u0085", 0x2028: "\\u2028", 0x2029: "\\u2029"}
+
+
+def _json_line(value: dict) -> str:
+    """``value`` as one line of JSON. Every line break in it is escaped, so model text
+    it carries can never end the entry, start another one or split the line."""
+    return json.dumps(value, ensure_ascii=False, default=str).translate(_UNESCAPED_BREAKS)
+
+
+def _labelled_json(head: str, label: str) -> dict | None:
+    """The JSON object on ``head``'s line starting with ``label``; None when there is none or it does not parse."""
+    for line in head.splitlines():
+        if line.startswith(label):
+            try:
+                value = json.loads(line[len(label):])
+            except ValueError:
+                return None
+            return value if isinstance(value, dict) else None
+    return None
+
+
+def _number(value) -> str:
+    return f"{value:g}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "n/a"
+
+
+def describe_outcome(plan: dict | None, outcome: dict | None) -> str:
+    """One line on what an intraday plan did, for the lessons later runs read."""
+    plan, outcome = plan or {}, outcome or {}
+    session = plan.get("session") or "its session"
+    reason = outcome.get("exit_reason")
+    if outcome.get("scored") is False or not reason:
+        return f"{session}: not scored ({outcome.get('note') or 'no outcome recorded'})"
+    if not outcome.get("triggered"):
+        note = outcome.get("note") or reason.replace("_", " ")
+        return f"{session}: no trade ({note})"
+    line = (f"{session}: {plan.get('direction')} filled at {_number(outcome.get('entry_price'))}, closed at "
+            f"{_number(outcome.get('exit_price'))} ({reason.replace('_', ' ')}); net P&L "
+            f"{_number(outcome.get('net_pnl'))}")
+    if isinstance(outcome.get("net_return_pct"), (int, float)):
+        line += f" ({outcome['net_return_pct']:+.2f}%)"
+    if isinstance(outcome.get("r_multiple"), (int, float)):
+        line += f", {outcome['r_multiple']:+.2f}R"
+    if not outcome.get("shares"):
+        line += ", per share"
+    return line

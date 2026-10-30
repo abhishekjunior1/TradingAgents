@@ -97,7 +97,7 @@ def _answer_every_prompt(monkeypatch):
 
     monkeypatch.setattr(cli_selections.updates, "enabled", lambda: False)
     monkeypatch.setattr(cli_selections, "get_ticker", lambda: "NVDA")
-    monkeypatch.setattr(cli_selections, "get_analysis_date", lambda: "2026-09-01")
+    monkeypatch.setattr(cli_selections, "get_analysis_date", lambda default=None: "2026-09-01")
     monkeypatch.setattr(cli_selections, "ask_output_language", lambda default=None: "English")
     monkeypatch.setattr(cli_selections, "select_analysts", lambda asset_type, default=None: [AnalystType.MARKET])
     monkeypatch.setattr(cli_selections, "select_research_depth", lambda default=None: 3)
@@ -149,7 +149,7 @@ def test_a_remembered_endpoint_is_offered_back(monkeypatch):
                         lambda default=None: offered.setdefault("default", default) or "http://x/v1")
     monkeypatch.setattr(cli_selections.updates, "enabled", lambda: False)
     monkeypatch.setattr(cli_selections, "get_ticker", lambda: "NVDA")
-    monkeypatch.setattr(cli_selections, "get_analysis_date", lambda: "2026-09-01")
+    monkeypatch.setattr(cli_selections, "get_analysis_date", lambda default=None: "2026-09-01")
     monkeypatch.setattr(cli_selections, "ask_output_language", lambda default=None: "English")
     monkeypatch.setattr(cli_selections, "select_analysts", lambda asset_type, default=None: [AnalystType.MARKET])
     monkeypatch.setattr(cli_selections, "select_research_depth", lambda default=None: 1)

@@ -1,6 +1,7 @@
 """yfinance-based news data fetching functions."""
 
 import contextlib
+import re
 from datetime import UTC, datetime
 
 import yfinance as yf
@@ -18,7 +19,9 @@ def _extract_article_data(article: dict) -> dict:
 
     Yahoo sends some fields as null rather than leaving them out, so each falls
     back to its default on a null as well as on a missing key (#1458).
+    ``related`` is the symbols a search result is tagged with; it is not printed.
     """
+    related = [str(t) for t in article.get("relatedTickers") or []]
     content = article.get("content")
     if isinstance(content, dict):
         url_obj = content.get("canonicalUrl") or content.get("clickThroughUrl") or {}
@@ -34,6 +37,7 @@ def _extract_article_data(article: dict) -> dict:
             "publisher": (content.get("provider") or {}).get("displayName") or "Unknown",
             "link": url_obj.get("url") or "",
             "pub_date": pub_date,
+            "related": related,
         }
     # Fallback for flat structure. Parse the epoch publish time so flat
     # articles are date-filterable too (otherwise they bypass the
@@ -51,6 +55,7 @@ def _extract_article_data(article: dict) -> dict:
         "publisher": article.get("publisher") or "Unknown",
         "link": article.get("link") or "",
         "pub_date": pub_date,
+        "related": related,
     }
 
 
@@ -72,10 +77,10 @@ def _search_news(canonical: str, limit: int) -> tuple[list, bool]:
     return tagged, knows or bool(search.news)
 
 
-def _format_articles(articles: list[dict]) -> str:
+def _format_articles(articles: list[dict], heading: str = "###") -> str:
     out = ""
     for data in articles:
-        out += f"### {data['title']} (source: {data['publisher']})\n"
+        out += f"{heading} {data['title']} (source: {data['publisher']})\n"
         if data["summary"]:
             out += f"{data['summary']}\n"
         if data["link"]:
@@ -134,6 +139,110 @@ def get_news_yfinance(
     return gap or f"No news found for {ticker}{resolved} between {start_date} and {end_date}"
 
 
+def _term_pattern(term: str) -> re.Pattern:
+    """Case-insensitive whole-word match for ``term`` (India, not Indiana)."""
+    return re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+
+
+def _relevant(data: dict, group: dict) -> bool:
+    """Whether an article belongs in ``group``.
+
+    A group with no ``terms``, ``weak_terms`` or ``tickers`` keeps every article.
+    Otherwise the title or summary must mention a term, or two ``weak_terms``
+    (each alone also names things outside the group, such as another country's
+    rupee or another RBI), or Yahoo must tag the article with one of the tickers
+    (an entry starting with "." matches any symbol with that suffix).
+    """
+    terms, weak = group.get("terms") or [], group.get("weak_terms") or []
+    tickers = [t.upper() for t in group.get("tickers") or []]
+    if not terms and not weak and not tickers:
+        return True
+    text = f"{data['title']} {data['summary']}"
+    if any(_term_pattern(term).search(text) for term in terms):
+        return True
+    if sum(bool(_term_pattern(term).search(text)) for term in weak) >= 2:
+        return True
+    suffixes = tuple(t for t in tickers if t.startswith("."))
+    return any(r.upper() in tickers or r.upper().endswith(suffixes) for r in data["related"])
+
+
+def _search_window(queries, fuzzy, limit, start_dt, end_dt, keep=None, seen=None) -> tuple[list[dict], int]:
+    """Up to ``limit`` in-window articles from Yahoo searches for ``queries``, and
+    how many more in-window articles were skipped as titles already kept.
+
+    Titles in ``seen`` are skipped and the ones kept are added to it, so several
+    groups searched in turn share no article.
+    """
+    seen = set() if seen is None else seen
+    articles, repeats = [], 0
+    for query in queries:
+        found = yf_retry(lambda q=query: yf.Search(
+            query=q,
+            news_count=limit,
+            enable_fuzzy_query=fuzzy,
+        ).news)
+
+        for article in found or []:
+            # Window first: the limit counts what the run may read, so an
+            # out-of-window article must not spend the budget or cut the
+            # remaining searches short (#1356). Flat articles are filtered
+            # on the same rule, so none can leak future news (#1007).
+            data = _extract_article_data(article)
+            if not in_window(data["pub_date"], start_dt, end_dt):
+                continue
+            if keep is not None and not keep(data):
+                continue
+            if data["title"] in seen:
+                repeats += 1
+            elif data["title"]:
+                seen.add(data["title"])
+                articles.append(data)
+
+        if len(articles) >= limit:
+            break
+    return articles, repeats
+
+
+def _split(counts: list[int], limit: int) -> list[int]:
+    """How many articles each group shows: an even split of ``limit``, the earlier
+    groups taking the remainder, and a share one group leaves unused going to the others."""
+    shares = [limit // len(counts) + (i < limit % len(counts)) for i in range(len(counts))]
+    taken = [min(n, share) for n, share in zip(counts, shares, strict=True)]
+    for i, n in enumerate(counts):
+        extra = min(limit - sum(taken), n - taken[i])
+        taken[i] += max(extra, 0)
+    return taken
+
+
+def _format_groups(groups: list[dict], found: list[tuple[list[dict], int]], limit: int) -> str:
+    """The groups' articles under one section each; empty when no group kept any.
+
+    ``found`` holds each group's articles and its count of in-window repeats of
+    titles already kept. A group showing nothing says why: the limit left it no
+    room, an earlier group's searches already found its stories, or its search kept none.
+    """
+    taken = _split([len(articles) for articles, _ in found], limit)
+    if not any(taken):
+        return ""
+    out = ""
+    for group, (articles, repeats), n in zip(groups, found, taken, strict=True):
+        queries = ", ".join(f'"{q}"' for q in group["queries"])
+        out += f"### {group['label']}\n{group.get('about') or 'Stories'} (Yahoo news searches: {queries}).\n\n"
+        if n:
+            out += _format_articles(articles[:n], heading="####")
+            continue
+        if articles:
+            empty = (f"{len(articles)} {group['label']} stories found in this window; none shown "
+                     f"within the article limit of {limit}.")
+        elif repeats:
+            empty = (f"Yahoo's news search returned no {group['label']} stories in this window "
+                     f"other than ones the searches above had already found.")
+        else:
+            empty = group.get("empty") or f"Yahoo's news search returned no {group['label']} stories in this window."
+        out += f"{empty}\n\n"
+    return out
+
+
 def get_global_news_yfinance(
     as_of_date: str,
     look_back_days: int | None = None,
@@ -141,6 +250,11 @@ def get_global_news_yfinance(
 ) -> str:
     """
     Retrieve global/macro economic news using yfinance Search.
+
+    With ``global_news_groups`` in the config (a list of ``{"label", "queries",
+    "fuzzy", "terms", "weak_terms", "tickers", "about", "empty"}``), the articles are searched
+    and reported per group, the limit split between them; otherwise
+    ``global_news_queries`` are searched as one list.
 
     Args:
         as_of_date: Current date in yyyy-mm-dd format
@@ -157,38 +271,25 @@ def get_global_news_yfinance(
         look_back_days = config["global_news_lookback_days"]
     if limit is None:
         limit = config["global_news_article_limit"]
-    search_queries = config["global_news_queries"]
+    groups = config.get("global_news_groups")
 
     curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
     start_dt = curr_dt - relativedelta(days=look_back_days)
     start_date = start_dt.strftime("%Y-%m-%d")
 
-    in_window_news = []
-    seen_titles = set()
-
-    for query in search_queries:
-        found = yf_retry(lambda q=query: yf.Search(
-            query=q,
-            news_count=limit,
-            enable_fuzzy_query=True,
-        ).news)
-
-        for article in found or []:
-            # Window first: the limit counts what the run may read, so an
-            # out-of-window article must not spend the budget or cut the
-            # remaining searches short (#1356). Flat articles are filtered
-            # on the same rule, so none can leak future news (#1007).
-            data = _extract_article_data(article)
-            if not in_window(data["pub_date"], start_dt, curr_dt):
-                continue
-            if data["title"] and data["title"] not in seen_titles:
-                seen_titles.add(data["title"])
-                in_window_news.append(data)
-
-        if len(in_window_news) >= limit:
-            break
-
-    news_str = _format_articles(in_window_news[:limit])
+    if groups:
+        # Each group is searched to the whole limit, so a share another group
+        # leaves unused can be filled; titles are not repeated across groups.
+        seen = set()
+        found = [
+            _search_window(g["queries"], g.get("fuzzy", True), limit, start_dt, curr_dt,
+                           lambda d, g=g: _relevant(d, g), seen)
+            for g in groups
+        ]
+        news_str = _format_groups(groups, found, limit)
+    else:
+        found, _ = _search_window(config["global_news_queries"], True, limit, start_dt, curr_dt)
+        news_str = _format_articles(found[:limit])
 
     # Nothing fell inside the window -> say so rather than return an
     # empty-bodied report (#993).

@@ -1,5 +1,6 @@
 import datetime
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -16,14 +17,19 @@ from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.model_catalog import get_model_options
 from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS, SIGNED_IN_PROVIDERS
 
-TICKER_INPUT_EXAMPLES = "SPY, 0700.HK, BTC-USD"
+TICKER_INPUT_EXAMPLES = "RELIANCE.NS, TCS.BO, NIFTY 50, SPY, BTC-USD"
 
 ANALYST_CHOICES = [
     ("Market Analyst", AnalystType.MARKET),
     ("Sentiment Analyst", AnalystType.SOCIAL),
     ("News Analyst", AnalystType.NEWS),
     ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
+    ("Day Trader (intraday plan)", AnalystType.DAY_TRADER),
 ]
+
+# The analysts a run gets when none are named: every one but the Day Trader,
+# which an intraday run adds by itself.
+DEFAULT_ANALYSTS = [analyst for _, analyst in ANALYST_CHOICES if analyst != AnalystType.DAY_TRADER]
 
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
 
@@ -80,11 +86,41 @@ def get_ticker() -> str:
     return normalize_ticker_symbol(ticker) if ticker.strip() else "SPY"
 
 
-def parse_ticker(value: str) -> str:
-    """A ticker given on the command line, canonical; empty or malformed is refused."""
+def parse_ticker(value: str, exchange: str | None = None) -> str:
+    """A ticker given on the command line, canonical; empty or malformed is refused.
+
+    With ``exchange`` (``NSE``/``BSE``), a bare symbol is read as that exchange's
+    listing: ``RELIANCE`` is ``RELIANCE.NS``.
+    """
+    from tradingagents.dataflows.symbols import resolve_symbol
+
     if not value.strip() or not is_valid_ticker_input(value):
         raise ValueError(f"not a ticker symbol: {value!r} (e.g. {TICKER_INPUT_EXAMPLES})")
-    return normalize_ticker_symbol(value)
+    return resolve_symbol(value, exchange)
+
+
+def parse_vendors(values: list[str] | None) -> dict[str, str]:
+    """``["core_stock_apis=alpha_vantage"]`` -> ``{"core_stock_apis": "alpha_vantage"}``, each one checked.
+
+    A category must exist and every vendor in its chain (``yfinance,alpha_vantage``)
+    must serve at least one of the category's methods, so a typo stops the run
+    before any model is called.
+    """
+    from tradingagents.dataflows.router import TOOLS_CATEGORIES, VENDOR_METHODS
+
+    chosen: dict[str, str] = {}
+    for value in values or []:
+        category, sep, chain = (part.strip() for part in value.partition("="))
+        if not sep or not category or not chain:
+            raise ValueError(f"--vendor takes category=vendor, got {value!r}")
+        if category not in TOOLS_CATEGORIES:
+            raise ValueError(f"unknown data category {category!r}; choose from {', '.join(TOOLS_CATEGORIES)}")
+        served = {v for method in TOOLS_CATEGORIES[category]["tools"] for v in VENDOR_METHODS.get(method, {})}
+        unknown = [v for v in (v.strip() for v in chain.split(",")) if v and v not in served]
+        if unknown:
+            raise ValueError(f"{category} has no vendor {', '.join(unknown)}; choose from {', '.join(sorted(served))}")
+        chosen[category] = chain
+    return chosen
 
 
 def parse_analysis_date(value: str) -> str:
@@ -98,10 +134,23 @@ def parse_analysis_date(value: str) -> str:
     return day.isoformat()
 
 
+def parse_horizon(value: str | None) -> str | None:
+    """--horizon's value, swing or intraday in any case; None when not given."""
+    from tradingagents.default_config import DECISION_HORIZONS
+
+    if value is None:
+        return None
+    horizon = value.strip().lower()
+    if horizon not in DECISION_HORIZONS:
+        raise ValueError(f"--horizon takes {' or '.join(DECISION_HORIZONS)}, got {value!r}")
+    return horizon
+
+
 def parse_analysts(value: str, asset_type: AssetType) -> list[AnalystType]:
     """Comma-separated analyst names, in the canonical order, checked against the asset."""
     # "sentiment" is the name users see; the analyst's key is "social".
-    names = [{"sentiment": "social"}.get(n, n) for n in (n.strip().lower() for n in value.split(",")) if n]
+    aliases = {"sentiment": "social", "day-trader": "day_trader", "daytrader": "day_trader"}
+    names = [aliases.get(n, n) for n in (n.strip().lower() for n in value.split(",")) if n]
     if not names:
         raise ValueError("name at least one analyst")
     known = {a.value: a for a in AnalystType}
@@ -146,10 +195,11 @@ def filter_analysts_for_asset_type(
 ) -> list[AnalystType]:
     if asset_type != AssetType.CRYPTO:
         return analysts
+    # A coin has no company fundamentals, and no session for an intraday plan.
     return [
         analyst
         for analyst in analysts
-        if analyst != AnalystType.FUNDAMENTALS
+        if analyst not in (AnalystType.FUNDAMENTALS, AnalystType.DAY_TRADER)
     ]
 
 
@@ -284,16 +334,18 @@ def _select_listed_model(title: str, models, default, custom) -> str:
     return custom() if choice == "custom" else choice
 
 
-def _require_text(message: str, hint: str) -> str:
+def _require_text(message: str, hint: str, valid=bool) -> str:
     """Prompt for a required value; exit cleanly if the user cancels.
 
     ``questionary.text(...).ask()`` returns None on Ctrl-C/Esc; mirror the
     exit-on-cancel behavior of the other required selections so a cancelled
     prompt never returns an empty model/deployment that would fail downstream.
+    ``valid`` checks the stripped answer (by default, that it is not empty);
+    ``hint`` is shown until it passes.
     """
     response = questionary.text(
         message,
-        validate=lambda x: len(x.strip()) > 0 or hint,
+        validate=lambda x: valid(x.strip()) or hint,
     ).ask()
     if response is None:
         console.print("\n[red]Cancelled. Exiting...[/red]")
@@ -326,8 +378,13 @@ def select_openrouter_model(mode: str, default=None) -> str:
 LISTED_LIVE = {"openrouter": select_openrouter_model, "chatgpt": select_chatgpt_model}
 
 
-def _prompt_custom_model_id() -> str:
-    """Prompt user to type a custom model ID."""
+def _prompt_custom_model_id(provider: str | None = None) -> str:
+    """Prompt user to type a custom model ID; a Claude Code one is checked as it is typed."""
+    if provider == "claude_code":
+        from tradingagents.llm_clients.claude_code_client import MODEL_EXAMPLES, is_model_id
+
+        return _require_text(f"Enter model ID (such as {MODEL_EXAMPLES}):",
+                             "A model ID has no spaces, e.g. claude-opus-5-5 or opus.", is_model_id)
     return _require_text("Enter model ID:", "Please enter a model ID.")
 
 
@@ -359,7 +416,7 @@ def _select_model(provider: str, mode: str, default=None) -> str:
         exit(1)
 
     if choice == "custom":
-        return _prompt_custom_model_id()
+        return _prompt_custom_model_id(provider.lower())
 
     return choice
 
@@ -389,6 +446,7 @@ def _llm_provider_table() -> list[tuple[str, str, str | None]]:
         ("Google", "google", None),
         ("Anthropic", "anthropic", "https://api.anthropic.com/"),
         ("ChatGPT (Plus or Pro plan)", "chatgpt", "https://api.openai.com/v1"),
+        ("Claude (Pro or Max plan, via Claude Code)", "claude_code", None),
         ("xAI", "xai", "https://api.x.ai/v1"),
         ("DeepSeek", "deepseek", "https://api.deepseek.com"),
         ("Qwen", "qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
@@ -430,6 +488,19 @@ def resolve_backend_url(
     return env_url or menu_url or provider_default_url(provider)
 
 
+# A URL's user name and password: what comes before an @ in its host part.
+_USERINFO = re.compile(r"^((?:[a-z][a-z0-9+.-]*:)?//)?[^/?#]*@", re.IGNORECASE)
+
+
+def shown_url(url: str | None) -> str | None:
+    """``url`` as printed, its user name, password and query as ``***``: they can hold
+    credentials, and the output can end up in logs. The run still uses ``url`` as given."""
+    if not url:
+        return url
+    shown, query, _ = _USERINFO.sub(r"\1***@", url).partition("?")
+    return f"{shown}?***" if query else shown
+
+
 def prompt_openai_compatible_url(default=None) -> str:
     """Prompt for a custom OpenAI-compatible endpoint base URL."""
     url = questionary.text(
@@ -447,6 +518,9 @@ def prompt_openai_compatible_url(default=None) -> str:
 
 # The menu entry that groups the providers used through a personal plan.
 _SUBSCRIPTION = ("subscription", None)
+# The plans under it: ChatGPT signs in here (`tradingagents login chatgpt`), a
+# Claude plan in the person's own Claude Code.
+SUBSCRIPTION_PROVIDERS = (*SIGNED_IN_PROVIDERS, "claude_code")
 
 
 def select_llm_provider(default=None) -> tuple[str, str | None]:
@@ -457,12 +531,12 @@ def select_llm_provider(default=None) -> tuple[str, str | None]:
     base = (default or "").split("-cn")[0]
     choices = []
     for display, provider_key, url in PROVIDERS:
-        if provider_key in SIGNED_IN_PROVIDERS:
+        if provider_key in SUBSCRIPTION_PROVIDERS:
             continue
         choices.append(questionary.Choice(display, value=(provider_key, url)))
         if provider_key == "anthropic":
-            choices.append(questionary.Choice("Subscription (use your ChatGPT plan)", value=_SUBSCRIPTION))
-    preselected = _SUBSCRIPTION if base in SIGNED_IN_PROVIDERS else next(
+            choices.append(questionary.Choice("Subscription (use your ChatGPT or Claude plan)", value=_SUBSCRIPTION))
+    preselected = _SUBSCRIPTION if base in SUBSCRIPTION_PROVIDERS else next(
         ((key, url) for _, key, url in PROVIDERS if key == base), None
     )
 
@@ -482,7 +556,7 @@ def select_llm_provider(default=None) -> tuple[str, str | None]:
         choice = questionary.select(
             "Select your subscription:",
             choices=[questionary.Choice(display, value=(key, url))
-                     for display, key, url in PROVIDERS if key in SIGNED_IN_PROVIDERS],
+                     for display, key, url in PROVIDERS if key in SUBSCRIPTION_PROVIDERS],
             style=_MENU_STYLE,
         ).ask()
         if choice is None:
@@ -645,11 +719,12 @@ def confirm_ollama_endpoint(url: str) -> None:
     """
     from_env = os.environ.get("OLLAMA_BASE_URL")
     origin = " (from OLLAMA_BASE_URL)" if from_env and from_env == url else ""
-    console.print(f"[green]✓ Using Ollama at {url}{origin}[/green]")
+    shown = shown_url(url)
+    console.print(f"[green]✓ Using Ollama at {shown}{origin}[/green]")
 
     if not url.startswith(("http://", "https://")):
         console.print(
-            f"[yellow]Note: {url!r} is missing a scheme. "
+            f"[yellow]Note: {shown!r} is missing a scheme. "
             f"Ollama-serve typically expects a URL like "
             f"http://<host>:11434/v1.[/yellow]"
         )
@@ -657,7 +732,7 @@ def confirm_ollama_endpoint(url: str) -> None:
         # Soft hint when the port differs from the ollama-serve default
         # and the host isn't local (where users sometimes proxy on :80).
         console.print(
-            f"[yellow]Note: {url!r} doesn't include port 11434. "
+            f"[yellow]Note: {shown!r} doesn't include port 11434. "
             f"Make sure your remote ollama-serve listens on the port "
             f"shown above.[/yellow]"
         )
@@ -667,7 +742,18 @@ def ensure_signed_in(provider: str) -> None:
     """Make sure a plan provider's sign-in works before the run, offering to sign in now.
 
     Signing in runs as its own process (``tradingagents login chatgpt``), so its
-    read of a pasted address ends with it and never takes a later answer."""
+    read of a pasted address ends with it and never takes a later answer. A Claude
+    plan is signed in to in Claude Code itself, so here it is only checked."""
+    if provider.lower() == "claude_code":
+        from tradingagents.llm_clients import claude_code_client
+
+        try:
+            plan = claude_code_client.signed_in_plan()
+        except claude_code_client.ClaudeCodeError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(code=1) from None
+        console.print(f"[green]✓ Using your Claude plan through Claude Code:[/green] {escape(plan)}")
+        return
     if provider.lower() not in SIGNED_IN_PROVIDERS:
         return
     from tradingagents.llm_clients import chatgpt_auth  # the one signed-in provider

@@ -130,6 +130,18 @@ def test_confirm_endpoint_quiet_on_local_no_port(monkeypatch, capsys):
     assert "Note" not in out  # localhost is fine without explicit port
 
 
+def test_confirm_endpoint_hides_credentials_in_the_url(monkeypatch, capsys):
+    """A user name, password or query in the URL can be a credential: each line shows ***."""
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    from cli import prompts
+    prompts.confirm_ollama_endpoint("https://user:FAKE-pw@remote-host/v1?key=FAKE-key")
+    prompts.confirm_ollama_endpoint("user:FAKE-pw@remote-host:11434/v1")
+    out = _console_out(capsys)
+    assert "FAKE" not in out
+    assert "https://***@remote-host/v1?***" in out and "port 11434" in out  # checked as given
+    assert "***@remote-host:11434/v1" in out and "missing a scheme" in out
+
+
 def test_ollama_model_labels_no_local_suffix():
     """Labels should no longer claim '(local)' since the endpoint is dynamic."""
     from tradingagents.llm_clients.model_catalog import get_model_options

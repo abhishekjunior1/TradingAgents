@@ -6,6 +6,13 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorUnavailableError,
 )
+from tradingagents.dataflows.vendors.agent_reach import (
+    get_global_news_agent_reach,
+    get_news_agent_reach,
+    get_video_coverage as get_agent_reach_video_coverage,
+    get_video_transcript as get_agent_reach_video_transcript,
+    read_web_page as get_agent_reach_web_page,
+)
 from tradingagents.dataflows.vendors.alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -26,6 +33,9 @@ from tradingagents.dataflows.vendors.sec_edgar import (
     get_cashflow as get_sec_edgar_cashflow,
     get_income_statement as get_sec_edgar_income_statement,
 )
+from tradingagents.dataflows.vendors.yahoo.corporate_actions import (
+    get_corporate_actions as get_yfinance_corporate_actions,
+)
 from tradingagents.dataflows.vendors.yahoo.fundamentals import (
     get_balance_sheet as get_yfinance_balance_sheet,
     get_cashflow as get_yfinance_cashflow,
@@ -33,9 +43,16 @@ from tradingagents.dataflows.vendors.yahoo.fundamentals import (
     get_income_statement as get_yfinance_income_statement,
     get_insider_transactions as get_yfinance_insider_transactions,
 )
+from tradingagents.dataflows.vendors.yahoo.intraday import (
+    get_intraday_bars as get_yfinance_intraday_bars,
+)
 from tradingagents.dataflows.vendors.yahoo.market import (
     get_stock_stats_indicators_window,
     get_YFin_data_online,
+)
+from tradingagents.dataflows.vendors.yahoo.market_context import (
+    get_market_context as get_yfinance_market_context,
+    get_watchlist_snapshot as get_yfinance_watchlist_snapshot,
 )
 from tradingagents.dataflows.vendors.yahoo.news import get_global_news_yfinance, get_news_yfinance
 
@@ -83,7 +100,34 @@ TOOLS_CATEGORIES = {
         "tools": [
             "get_prediction_markets",
         ]
-    }
+    },
+    "market_context": {
+        "description": "Benchmarks, sector index, volatility index, currency and crude around the instrument",
+        "tools": [
+            "get_market_context",
+            "get_watchlist_snapshot",
+        ]
+    },
+    "corporate_actions": {
+        "description": "Dividends, splits and scheduled company events",
+        "tools": [
+            "get_corporate_actions",
+        ]
+    },
+    "web_research": {
+        "description": "Web pages and YouTube videos and captions (Agent-Reach, no-login channels)",
+        "tools": [
+            "read_web_page",
+            "get_video_coverage",
+            "get_video_transcript",
+        ]
+    },
+    "intraday_data": {
+        "description": "Intraday bars, levels and paper sizing (day-trader mode)",
+        "tools": [
+            "get_intraday_bars",
+        ]
+    },
 }
 
 # Optional enrichment categories. These add macro/event context to the news
@@ -91,7 +135,20 @@ TOOLS_CATEGORIES = {
 # sentinel instead of aborting the run (a bad LLM-supplied indicator, a missing
 # key, or a network blip should not crash an analysis over flavour data). Core
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
-OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
+OPTIONAL_CATEGORIES = {
+    "macro_data", "prediction_markets", "market_context", "corporate_actions", "web_research", "intraday_data",
+}
+
+# The news methods. A news vendor that finds nothing in the window can raise
+# NoMarketDataError so the next vendor is tried (Agent-Reach's web search does), but
+# a search without a date filter has not shown that the window had no news, so a
+# chain that ends there says so (``no_news_available``).
+NEWS_METHODS = frozenset({"get_news", "get_global_news"})
+
+# Vendors that run a program the user installs on purpose (docs/agent-reach.md):
+# a "default" chain includes one only when its config switch is on. Naming one in
+# a chain uses it either way.
+OPT_IN_VENDORS = {"agent_reach": "agent_reach_enabled"}
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
@@ -129,10 +186,12 @@ VENDOR_METHODS = {
     "get_news": {
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
+        "agent_reach": get_news_agent_reach,
     },
     "get_global_news": {
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
+        "agent_reach": get_global_news_agent_reach,
     },
     "get_insider_transactions": {
         "alpha_vantage": get_alpha_vantage_insider_transactions,
@@ -145,6 +204,31 @@ VENDOR_METHODS = {
     # prediction_markets
     "get_prediction_markets": {
         "polymarket": get_polymarket_prediction_markets,
+    },
+    # market_context
+    "get_market_context": {
+        "yfinance": get_yfinance_market_context,
+    },
+    "get_watchlist_snapshot": {
+        "yfinance": get_yfinance_watchlist_snapshot,
+    },
+    # corporate_actions
+    "get_corporate_actions": {
+        "yfinance": get_yfinance_corporate_actions,
+    },
+    # web_research
+    "read_web_page": {
+        "agent_reach": get_agent_reach_web_page,
+    },
+    "get_video_coverage": {
+        "agent_reach": get_agent_reach_video_coverage,
+    },
+    "get_video_transcript": {
+        "agent_reach": get_agent_reach_video_transcript,
+    },
+    # intraday_data
+    "get_intraday_bars": {
+        "yfinance": get_yfinance_intraday_bars,
     },
 }
 
@@ -197,6 +281,26 @@ def no_data_available(error: NoMarketDataError) -> str:
     )
 
 
+def no_news_available(method: str, error: NoMarketDataError) -> str:
+    """What a news call returns when every vendor that answered found nothing in the window.
+
+    Unlike ``no_data_available`` it says nothing about the symbol: an empty search
+    is no sign that a symbol is invalid or delisted.
+    """
+    if method == "get_news":
+        resolved = "" if error.canonical == error.symbol else f" (resolved to '{error.canonical}')"
+        subject = f"news for '{error.symbol}'{resolved}"
+    else:
+        subject = "global news"
+    reason = f" ({error.detail})" if error.detail else ""
+    return (
+        f"NO_DATA_AVAILABLE: No configured vendor found {subject} in the requested window{reason}. "
+        f"A search without a date filter that finds nothing in a window has not shown an "
+        f"absence of news: report the news for this window as unavailable, not as no news, "
+        f"and do not invent any."
+    )
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
@@ -212,8 +316,10 @@ def route_to_vendor(method: str, *args, **kwargs):
     # vendors the user did not choose (#988/#289) — that returned data from an
     # unexpected source and caused cross-vendor inconsistencies. For multi-vendor
     # fallback, list them in order, e.g. data_vendors="yfinance,alpha_vantage".
-    # The "default" sentinel (no explicit config) uses all available vendors.
+    # The "default" sentinel (no explicit config) uses all available vendors,
+    # an opt-in one only when it is switched on.
     explicit = [v for v in primary_vendors if v and v != "default"]
+    switched_off: list[str] = []
     if explicit:
         vendor_chain = [v for v in explicit if v in VENDOR_METHODS[method]]
         if not vendor_chain:
@@ -222,12 +328,20 @@ def route_to_vendor(method: str, *args, **kwargs):
                 f"Available: {all_available_vendors}."
             )
     else:
-        vendor_chain = all_available_vendors
+        config = get_config()
+        switched_off = [v for v in all_available_vendors
+                        if v in OPT_IN_VENDORS and not config.get(OPT_IN_VENDORS[v])]
+        vendor_chain = [v for v in all_available_vendors if v not in switched_off]
 
     last_no_data: NoMarketDataError | None = None
     last_unavailable: VendorUnavailableError | None = None
     failed: Exception | None = None     # a vendor that raised something untyped
     first_error: Exception | None = None
+    if not vendor_chain:
+        first_error = VendorNotConfiguredError(
+            f"{', '.join(switched_off)} is switched off; set "
+            f"{', '.join(OPT_IN_VENDORS[v] for v in switched_off)} to use it"
+        )
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
@@ -279,6 +393,8 @@ def route_to_vendor(method: str, *args, **kwargs):
                 "Returning NO_DATA for %s, but a vendor errored earlier: %s",
                 method, first_error,
             )
+        if method in NEWS_METHODS:
+            return no_news_available(method, last_no_data)
         return no_data_available(last_no_data)
 
     # No vendor returned data and none reported clean "no data" — surface the

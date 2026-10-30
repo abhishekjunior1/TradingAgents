@@ -84,6 +84,7 @@ Our framework decomposes complex trading tasks into specialized roles.
 - Sentiment Analyst: Aggregates news headlines, StockTwits, and Reddit chatter into a single sentiment read to gauge short-term market mood.
 - News Analyst: Monitors global news and macroeconomic indicators, interpreting the impact of events on market conditions.
 - Technical Analyst: Utilizes technical indicators (like MACD and RSI) to detect trading patterns and forecast price movements.
+- Day Trader: In intraday mode, reads 5-minute bars for one session's levels (opening range, VWAP, pivots, ATR) and paper position sizes, so the team can plan that session ([intraday plans](#intraday-day-trader-plans)).
 
 The selected analysts work at the same time, each on its own tools, and the research debate starts once all of their reports are in.
 
@@ -181,11 +182,14 @@ export NVIDIA_API_KEY=...          # NVIDIA NIM
 export FRED_API_KEY=...            # FRED macro data (free, optional)
 export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
 export TYPESAFE_API_KEY=...        # Jev social-post screening (optional)
+export ALPHARENA_API_KEY=...       # AlphArena paper trading (optional; its sandbox aa_test_ key first)
 ```
 
 For Azure OpenAI, copy `.env.enterprise.example` to `.env.enterprise` and fill in your credentials. With Docker, put these keys in `.env` instead: the image does not include `.env` files.
 
 To run on your ChatGPT Plus or Pro plan instead of an API key, choose "Subscription" in the CLI's provider menu, or set `llm_provider: "chatgpt"`. Sign in once with `tradingagents login chatgpt`: it prints an address to open in your browser, which returns to this machine on `127.0.0.1`. When the browser runs on another machine, or TradingAgents runs in Docker (`docker compose run --rm tradingagents login chatgpt`), paste the address the browser ends up on. The sign-in is kept in `~/.tradingagents/chatgpt-auth.json`, and `tradingagents logout chatgpt` revokes it. Runs count toward your plan's usage limits, and the plan does not accept `temperature` or `max_tokens`.
+
+To run on your Claude Pro or Max plan instead of an API key, install [Claude Code](https://code.claude.com) and sign in with `claude auth login` using your Claude account, then choose "Subscription" and then "Claude" in the CLI's provider menu, or set `llm_provider: "claude_code"`. Anthropic allows a plan only in the unmodified Claude Code app, so TradingAgents never sees your sign-in: each model call runs your own `claude -p`, started with no tools, MCP servers, hooks, plugins, settings or CLAUDE.md, saving nothing, in an empty folder, and the analysts' data tools stay in TradingAgents. `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL` are withheld from those calls, so they use the plan rather than a key, and so are your other keys and tokens (variables named like `*_API_KEY`, `*_TOKEN`, `*_SECRET` or `*_PASSWORD`), which Claude Code does not need. Runs count toward your plan's usage limits, which Anthropic sizes for ordinary individual use; a full run makes dozens of model calls, each taking a few seconds longer than a direct API call. Claude Code takes no `temperature` or `max_tokens`, and the Docker image does not include it.
 
 For AWS Bedrock, install the extra with `pip install ".[bedrock]"`, set `llm_provider: "bedrock"`, configure AWS credentials (environment variables, `~/.aws/credentials`, or an IAM role) and `AWS_DEFAULT_REGION`, and use a Bedrock model ID, e.g. `us.anthropic.claude-opus-5-5`.
 
@@ -231,6 +235,17 @@ TradingAgents works with any market Yahoo Finance covers, using the exchange-suf
 - China A-shares: Shanghai `.SS`, Shenzhen `.SZ` (e.g. `600519.SS` for Kweichow Moutai)
 - Crypto: `BTC-USD`, `ETH-USD`
 
+#### Indian markets (NSE / BSE)
+
+NSE and BSE listings get Indian market data, rules and reasoning: tickers as brokers write them (`NSE:RELIANCE`, `RELIANCE-EQ`, or `RELIANCE` with `--exchange nse`) and index names (`NIFTY 50`, `BANKNIFTY`, `SENSEX`); IST sessions, the 2026 NSE/BSE holiday calendar and the closing-auction hours; a market-context tool (NIFTY 50, SENSEX, NIFTY Bank, India VIX, the closest NIFTY sector index, USD/INR, Brent); dividends, splits and results dates; global news in India and Global sections (Yahoo carries little India news; see docs/india.md) and Indian subreddits; India macro series from FRED; INR portfolios with risk figures, configurable trading charges and capital-gains tax; and reports that say what they are (research, not SEBI-registered advice; no orders placed).
+
+```bash
+tradingagents --exchange nse --ticker RELIANCE --analysts market,news,fundamentals
+tradingagents market --watchlist HDFCBANK,ICICIBANK,SBIN   # NSE session, indices, rupee, crude and these stocks; no model called
+```
+
+See [docs/india.md](docs/india.md) for setup, data sources and their limits and costs, charges and tax, and what is not available. Intraday (MIS) paper plans for NSE/BSE stocks are in [docs/intraday.md](docs/intraday.md), and the optional Agent-Reach web search is another source of India news ([docs/agent-reach.md](docs/agent-reach.md)).
+
 <p align="center">
   <img src="assets/cli/cli_init.png" width="100%" style="display: inline-block; margin: 0 2%;">
 </p>
@@ -244,6 +259,38 @@ An interface will appear showing results as they load, letting you track the age
 <p align="center">
   <img src="assets/cli/cli_transaction.png" width="100%" style="display: inline-block; margin: 0 2%;">
 </p>
+
+### Intraday (day-trader) plans
+
+`--horizon intraday` plans one trading session instead of rating a position over the holding period. The Day Trader joins the analysts, and the Trader and Portfolio Manager write a paper plan for the session: direction, entry, stop, target, exit-by time, size and what invalidates it. The date defaults to today (the listing's date when it is behind your machine's: New York's for a US ticker from India after midnight), and a past `--date` plans the session after it. A later run scores the plan on that session's 5-minute bars once its close is final, charges included. NSE/BSE plans exit by the broker square-off time (`TRADINGAGENTS_INTRADAY_SQUARE_OFF`, default 15:10 IST). Plans are paper only: nothing is sent to a broker.
+
+```bash
+tradingagents --horizon intraday --exchange nse --ticker RELIANCE --analysts market,news
+```
+
+In Claude Code, opened in this folder, the `/day-trader` skill runs the same headless analysis for one NSE or BSE stock and summarises the plan from the saved report: `/day-trader RELIANCE`, or `/day-trader TCS bse`. See [docs/intraday.md](docs/intraday.md) for the cut-off and session rules, broker square-off times, charges and leverage, Yahoo's intraday limits, and how plans are scored.
+
+### Web research through Agent-Reach (optional)
+
+With [Agent-Reach](docs/agent-reach.md) installed separately and switched on, company and global news come from Exa's web search first, falling back to Yahoo when it fails or finds nothing dated in the window, and the News Analyst can also read web pages, list YouTube coverage and read a video's captions. It needs no account or key, and only its no-login channels are used; backtests never use it. Install it the isolated way the page describes, never from the PyPI package of that name, and never run its `setup` or `update`.
+
+```bash
+export TRADINGAGENTS_AGENT_REACH=1
+export TRADINGAGENTS_AGENT_REACH_COMMAND=~/.tradingagents/agent-reach/env/bin/agent-reach
+tradingagents --ticker RELIANCE.NS --analysts market,news
+```
+
+### Paper trading on AlphArena (optional)
+
+[AlphArena](docs/arena.md) is a public arena where trading agents compete with simulated money on US stocks and ETFs. With `TRADINGAGENTS_ARENA=1` (or `--arena`) and your own `ALPHARENA_API_KEY`, the CLI shows a swing decision on a US stock or ETF, dated today in New York, as a paper trade after the run, and sends it only when you confirm (`--arena-yes` sends without asking). It checks before the run that the decision could be sent and that the key fits `TRADINGAGENTS_ARENA_MODE`. A US ticker's default date is the earlier of your machine's date and New York's, so from India after midnight it is New York's; on a machine whose date is behind New York's (California after 21:00), no run can be sent until the machine's midnight. Indian listings are never sent, since SEBI has cautioned against public paper-trading platforms built on Indian listed-stock prices, and neither are intraday plans or backtests. You register with AlphArena and accept its terms yourself; start with its sandbox key.
+
+```bash
+tradingagents --ticker AAPL --analysts market,news --arena
+tradingagents arena status                 # your agent's public profile and P&L (TRADINGAGENTS_ARENA_AGENT_ID)
+tradingagents arena leaderboard --period 7d
+```
+
+See [docs/arena.md](docs/arena.md) for its risks, what is sent and what never is, and the ledger of every trade sent.
 
 ## TradingAgents Package
 

@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import datetime
 
 import pandas as pd
 import yfinance as yf
@@ -7,7 +8,7 @@ import yfinance as yf
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.files import replace_file
-from tradingagents.dataflows.symbols import normalize_symbol, safe_ticker_component
+from tradingagents.dataflows.symbols import listing_zone, normalize_symbol, safe_ticker_component
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ def _assert_ohlcv_not_stale(
         )
 
 
-def _cache_is_fresh(data_file, as_of_dt, now) -> bool:
+def _cache_is_fresh(data_file, as_of_dt, now, zone=None) -> bool:
     """Whether the symbol's cached download can serve this request.
 
     The file holds the download made on the day it was written, so it serves
@@ -151,11 +152,24 @@ def _cache_is_fresh(data_file, as_of_dt, now) -> bool:
     than the TTL: Yahoo publishes a partial daily candle during market hours,
     whose ``Close`` is not the closing price, and row inspection cannot tell it
     from a final one (#1150).
+
+    With ``zone`` (the listing's, see ``symbols.listing_zone``) the day is the
+    listing's own. The machine's date can run ahead of it: in India it turns at
+    midnight while the US session that opened the evening before still trades,
+    so a download made then holds that session's forming bar under a date the
+    machine already counts as past.
     """
-    written = pd.Timestamp.fromtimestamp(os.path.getmtime(data_file))
-    if written.date() != now.date():
+    written = os.path.getmtime(data_file)
+    if zone is None:
+        written = pd.Timestamp.fromtimestamp(written)
+        if written.date() != now.date():
+            return False
+        return as_of_dt.date() < now.date() or (now - written).total_seconds() <= OHLCV_CACHE_TTL_SECONDS
+    moment = now.to_pydatetime().astimezone()   # a naive ``now`` is the machine's local time
+    today = moment.astimezone(zone).date()
+    if datetime.fromtimestamp(written, zone).date() != today:
         return False
-    return as_of_dt.date() < now.date() or (now - written).total_seconds() <= OHLCV_CACHE_TTL_SECONDS
+    return as_of_dt.date() < today or moment.timestamp() - written <= OHLCV_CACHE_TTL_SECONDS
 
 
 def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataFrame:
@@ -202,7 +216,7 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
         if (
             not cached.empty
             and "Close" in cached.columns
-            and _cache_is_fresh(data_file, as_of_dt, now)
+            and _cache_is_fresh(data_file, as_of_dt, now, listing_zone(canonical))
         ):
             data = cached
 

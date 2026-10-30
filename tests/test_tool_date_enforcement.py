@@ -62,6 +62,12 @@ DATED_TOOLS = [
     tools.get_indicators,
     tools.get_macro_indicators,
     tools.get_verified_market_snapshot,
+    tools.get_market_context,
+    tools.get_corporate_actions,
+    tools.read_web_page,
+    tools.get_video_coverage,
+    tools.get_video_transcript,
+    tools.get_intraday_snapshot,
 ]
 
 
@@ -75,6 +81,7 @@ INSTRUMENT_TOOLS = [
     tools.get_stock_data, tools.get_indicators, tools.get_verified_market_snapshot,
     tools.get_fundamentals, tools.get_balance_sheet, tools.get_cashflow,
     tools.get_income_statement, tools.get_news, tools.get_insider_transactions,
+    tools.get_market_context, tools.get_corporate_actions, tools.get_intraday_snapshot,
 ]
 
 
@@ -147,6 +154,34 @@ def test_a_statement_frequency_is_one_the_vendors_serve(tool):
     # Any other word was served annual figures under the word asked for.
     schema = tool.tool_call_schema.model_json_schema()["properties"]["freq"]
     assert schema["enum"] == ["annual", "quarterly"]
+
+
+@pytest.mark.unit
+def test_the_intraday_snapshot_serves_the_run_date_and_instrument():
+    args = _run(tools.get_intraday_snapshot, {"symbol": "RSI", "interval": "15m", "sessions": 3}, tools)
+    assert args == ("get_intraday_bars", "NVDA", TRADE_DATE, "15m", 3)
+
+
+@pytest.mark.unit
+def test_the_intraday_snapshot_offers_only_the_intervals_yahoo_serves():
+    # 30m bars come back misaligned from Yahoo, so they are not offered.
+    schema = tools.get_intraday_snapshot.tool_call_schema.model_json_schema()["properties"]
+    assert schema["interval"]["enum"] == ["1m", "5m", "15m"]
+    assert "portfolio_value" not in schema
+
+
+@pytest.mark.unit
+def test_a_web_page_or_video_is_read_as_of_the_run_date():
+    assert _run(tools.read_web_page, {"url": "https://example.com/a"}, tools) == (
+        "read_web_page", "https://example.com/a", TRADE_DATE)
+    assert _run(tools.get_video_transcript, {"video": "dQw4w9WgXcQ"}, tools) == (
+        "get_video_transcript", "dQw4w9WgXcQ", TRADE_DATE)
+
+
+@pytest.mark.unit
+def test_a_future_date_for_video_coverage_is_clamped():
+    args = _run(tools.get_video_coverage, {"query": "Reliance results", "curr_date": "2026-09-14"}, tools)
+    assert args == ("get_video_coverage", "Reliance results", TRADE_DATE, None)
 
 
 @pytest.mark.unit

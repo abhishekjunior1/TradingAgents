@@ -13,12 +13,17 @@ from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
 from tradingagents.dataflows.symbols import safe_ticker_component
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.dataflows.vendors.yahoo.intraday import plan_session
+from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
+from tradingagents.default_config import DECISION_HORIZONS, DEFAULT_CONFIG, with_agent_reach_news
 from tradingagents.llm_clients import create_tier_client, tier_provider
+from tradingagents.markets.intraday import configured_intraday_costs
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
+from tradingagents.portfolio_risk import book_value, portfolio_risk_block
 from tradingagents.reporting import write_report_tree
 
+from .analyst_execution import analysts_for_horizon
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
 from .propagation import Propagator
@@ -41,10 +46,22 @@ def _validate_trade_date(trade_date) -> str:
     return value
 
 
+def decision_horizon(config) -> str:
+    """The run's decision horizon, swing or intraday (``decision_horizon``; default swing)."""
+    horizon = str((config or {}).get("decision_horizon") or "swing").strip().lower()
+    if horizon not in DECISION_HORIZONS:
+        raise ValueError(f"decision_horizon must be one of {', '.join(DECISION_HORIZONS)}, "
+                         f"got {(config or {}).get('decision_horizon')!r}")
+    return horizon
+
+
 # Config keys that do not change what a run writes: where it keeps its files,
-# whether it checkpoints, and how often it retries a provider.
+# whether it checkpoints, how often it retries a provider, and whether the CLI
+# offers its decision to AlphArena afterwards.
 _NOT_IN_SIGNATURE = frozenset({
     "results_dir", "data_cache_dir", "memory_log_path", "checkpoint_enabled", "llm_max_retries",
+    "arena_enabled", "arena_mode", "arena_agent_id", "arena_buy_position_usd",
+    "arena_overweight_position_usd", "arena_allow_short", "arena_send_thesis", "arena_ledger_path",
 })
 
 
@@ -67,7 +84,17 @@ class TradingAgentsGraph:
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
         """
         self.debug = debug
-        self.config = config or DEFAULT_CONFIG
+        # agent_reach_enabled set in a config, rather than by the environment the
+        # defaults read, also puts Agent-Reach first in a news_data left as it was;
+        # switched off there, it takes Agent-Reach out of the default the environment set.
+        self.config = with_agent_reach_news(config or DEFAULT_CONFIG,
+                                            untouched=DEFAULT_CONFIG["data_vendors"].get("news_data"))
+        horizon = decision_horizon(self.config)
+        if self.config.get("decision_horizon", "swing") != horizon:
+            self.config = {**self.config, "decision_horizon": horizon}
+        # A mistyped intraday charges profile or override fails here, not in a plan's
+        # sizing or in a later settlement (any run may settle an intraday plan).
+        configured_intraday_costs(self.config)
         self.callbacks = callbacks or []
 
         set_config(self.config)
@@ -98,6 +125,7 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.conditional_logic,
             max_tool_rounds,
+            config=self.config,
         )
 
         self.propagator = Propagator(
@@ -105,14 +133,16 @@ class TradingAgentsGraph:
         )
         self.reflector = Reflector(self.quick_thinking_llm)
 
-        # Graph-shape-affecting run choices, kept for the checkpoint signature.
-        self.selected_analysts = tuple(selected_analysts)
+        # Graph-shape-affecting run choices, kept for the checkpoint signature. An
+        # intraday plan is grounded in the Day Trader's levels, which join the analysts.
+        self.selected_analysts = analysts_for_horizon(selected_analysts, horizon)
 
         # Set up the graph: keep the workflow for recompilation with a checkpointer.
-        self.workflow = self.graph_setup.setup_graph(selected_analysts, memory_node=self._memory_step)
+        self.workflow = self.graph_setup.setup_graph(self.selected_analysts, memory_node=self._memory_step)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
         self._resuming = False
+        self._run_symbol = None
 
     def resolve_instrument_context(self, ticker: str, asset_type: str = "stock",
                                    trade_date: str | None = None) -> str:
@@ -127,15 +157,22 @@ class TradingAgentsGraph:
         identity = resolve_instrument_identity(ticker)
         return build_instrument_context(ticker, asset_type, identity, trade_date)
 
-    def _memory_as_of(self, trade_date) -> str | None:
+    def _memory_as_of(self, trade_date, symbol=None) -> str | None:
         """Point-in-time cutoff for past-context lessons (#1251).
 
-        A historical/backtest run (trade date before today) filters lessons to
-        those already resolved by the trade date. A current-date run returns
-        None, disabling the filter so live behavior and pre-migration entries
-        (which have no stored resolution date) are unaffected.
+        A historical/backtest run (trade date before today, on ``symbol``'s
+        listing) filters lessons to those already resolved by the trade date. A
+        current-date run returns None, disabling the filter so live behavior and
+        pre-migration entries (which have no stored resolution date) are unaffected.
         """
-        return str(trade_date) if is_historical(trade_date) else None
+        return str(trade_date) if is_historical(trade_date, symbol) else None
+
+    def _run_scope(self, company_name) -> dict:
+        """The config a run serves its tools: the graph's, plus the run's listing
+        (``run_symbol``), whose date can be "today" when the machine's has moved on
+        (``date_window.today_for``). It stays out of ``self.config``, so neither the
+        checkpoint signature nor ``run_settings`` changes with it."""
+        return {**self.config, "run_symbol": company_name}
 
     def _run_signature(self, asset_type: str, portfolio=None) -> str:
         """Run inputs that must invalidate a checkpoint if changed.
@@ -154,6 +191,8 @@ class TradingAgentsGraph:
             f"debate={self.config['max_debate_rounds']}",
             f"risk={self.config['max_risk_discuss_rounds']}",
             f"asset={asset_type}",
+            # A swing rating and an intraday plan are different decisions.
+            f"horizon={decision_horizon(self.config)}",
             # None, an empty book and a changed book are three different runs.
             f"portfolio={portfolio.fingerprint() if portfolio is not None else 'none'}",
             # The layout itself: a checkpoint saved when analysts ran one after
@@ -182,7 +221,7 @@ class TradingAgentsGraph:
         """
         trade_date = _validate_trade_date(trade_date)
 
-        with run_config(self.config), \
+        with run_config(self._run_scope(company_name)), \
                 self.checkpoint_scope(company_name, trade_date, asset_type, portfolio) as thread_id_value:
             return self._run_graph(
                 company_name, trade_date, asset_type=asset_type,
@@ -201,6 +240,7 @@ class TradingAgentsGraph:
         graph, making the flag a no-op.
         """
         self._resuming = False
+        self._run_symbol = company_name     # a resumed stream starts from None, not a state
         if not self.config.get("checkpoint_enabled"):
             return None
         signature = self._run_signature(asset_type, portfolio)
@@ -272,6 +312,10 @@ class TradingAgentsGraph:
             "output_language": cfg.get("output_language"),
             "data_vendors": dict(cfg.get("data_vendors") or {}),
             "tool_vendors": dict(cfg.get("tool_vendors") or {}),
+            # The vendors name the news chain; this says whether the News Analyst
+            # could also read web pages and videos through Agent-Reach.
+            "agent_reach_enabled": bool(cfg.get("agent_reach_enabled")),
+            "decision_horizon": decision_horizon(cfg),
         }
 
     def save_reports(self, final_state, ticker, save_path=None, html=True) -> Path:
@@ -295,16 +339,67 @@ class TradingAgentsGraph:
 
         Injects the resolved instrument identity for every agent (#814). The
         memory log's lessons are not here: the graph's Memory Log step settles
-        and loads them alongside the analysts (see ``_memory_step``).
+        and loads them alongside the analysts (see ``_memory_step``). An
+        intraday run also fixes the session its plan is for (``intraday_context``).
         """
         trade_date = _validate_trade_date(trade_date)
+        intraday = {}
+        if decision_horizon(self.config) == "intraday":
+            if asset_type == "crypto":
+                raise ValueError("The intraday horizon plans one session of an exchange-listed instrument; "
+                                 "crypto trades around the clock, and its sessions are not modelled")
+            intraday = {"decision_horizon": "intraday",
+                        "intraday_context": self._intraday_context(company_name, trade_date)}
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
             asset_type=asset_type,
             instrument_context=self.resolve_instrument_context(company_name, asset_type, trade_date),
-            portfolio_context=portfolio.render(company_name) if portfolio is not None else "",
+            portfolio_context=self._portfolio_context(company_name, trade_date, portfolio)
+            if portfolio is not None else "",
+            # Only the Day Trader's paper sizes use it (an intraday run always has the Day
+            # Trader), so other runs fetch no holding's prices for it.
+            portfolio_value=self._portfolio_value(company_name, trade_date, portfolio)
+            if portfolio is not None and "day_trader" in self.selected_analysts else None,
+            **intraday,
         )
+
+    def _intraday_context(self, ticker: str, trade_date: str) -> dict:
+        """The intraday plan's session, exit-by time and reference price (``plan_session``); never raises."""
+        try:
+            return plan_session(ticker, trade_date)
+        except Exception as exc:  # noqa: BLE001 — the plan is then recorded without a session, and not scored
+            logger.warning("Intraday session unavailable for %s: %s", ticker, exc)
+            return {"note": f"the plan's session could not be worked out ({type(exc).__name__})"}
+
+    def _portfolio_value(self, ticker: str, trade_date: str, portfolio) -> float | None:
+        """The book's value for paper sizing (holdings at their last close plus cash), or None."""
+        try:
+            return book_value(portfolio, ticker, lambda symbol: load_ohlcv(symbol, trade_date))
+        except Exception as exc:  # noqa: BLE001 — sizing then uses the configured paper capital
+            logger.warning("Portfolio value unavailable: %s", exc)
+            return None
+
+    def _portfolio_context(self, ticker: str, trade_date: str, portfolio) -> str:
+        """The book as the decision agents see it: its holdings, then its risk figures.
+
+        The figures are computed from prices up to the run date; if they cannot
+        be, the holdings alone are given, as before.
+        """
+        text = portfolio.render(ticker)
+        if not self.config.get("portfolio_risk", True):
+            return text
+        try:
+            block = portfolio_risk_block(
+                portfolio, ticker, trade_date,
+                prices=lambda symbol: load_ohlcv(symbol, trade_date),
+                sector_of=lambda symbol: resolve_instrument_identity(symbol).get("sector"),
+                config=self.config,
+            )
+        except Exception as exc:  # noqa: BLE001 — the figures are an aid; the holdings still reach the agents
+            logger.warning("Portfolio risk figures unavailable: %s", exc)
+            return text
+        return f"{text}\n\n{block}"
 
     def _memory_step(self, state):
         """The graph's Memory Log step, alongside the analysts (#1428): settle every
@@ -328,7 +423,8 @@ class TradingAgentsGraph:
             note = f"Past decisions could not be settled this run ({type(exc).__name__}); they stay pending."
         try:
             past_context = self.memory_log.get_past_context(
-                state["company_of_interest"], as_of=self._memory_as_of(state["trade_date"]))
+                state["company_of_interest"],
+                as_of=self._memory_as_of(state["trade_date"], state["company_of_interest"]))
         except Exception as exc:
             logger.warning("Reading the memory log failed: %s", exc)
             past_context = ""
@@ -365,9 +461,12 @@ class TradingAgentsGraph:
             logger.warning("No final decision for %s on %s; nothing added to the memory log",
                            company_name, trade_date)
             return
+        # An intraday run's plan goes with it, tagged intraday, for its own settlement.
+        intraday = final_state.get("decision_horizon") == "intraday"
         self.memory_log.store_decision(
             ticker=company_name, trade_date=trade_date, final_trade_decision=decision,
             rating=run_rating(final_state),
+            **({"intraday_plan": final_state.get("intraday_plan") or {}} if intraday else {}),
         )
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
@@ -417,9 +516,12 @@ class TradingAgentsGraph:
         """
         args = {**args, "stream_mode": ["values", "tasks"]}
         # The graph's own config serves every tool call, as in propagate(), even
-        # when the process-wide config has changed since. Each step runs in the
-        # run's context, so the caller keeps its own between steps.
-        context = run_config_context(self.config)
+        # when the process-wide config has changed since, with the run's listing:
+        # the initial state's, or on a resumed checkpoint (``None``) the one
+        # begin_checkpoint was given. Each step runs in the run's context, so the
+        # caller keeps its own between steps.
+        symbol = graph_input.get("company_of_interest") if isinstance(graph_input, dict) else None
+        context = run_config_context(self._run_scope(symbol or getattr(self, "_run_symbol", None)))
         stream = context.run(self.graph.stream, graph_input, subgraphs=True, **args)
         try:
             while (step := context.run(next, stream, None)) is not None:
@@ -444,6 +546,9 @@ class TradingAgentsGraph:
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
+            # The intraday keys, only in a run that has them.
+            **{key: final_state[key] for key in ("intraday_report", "decision_horizon", "intraday_context",
+                                                  "intraday_plan") if final_state.get(key)},
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

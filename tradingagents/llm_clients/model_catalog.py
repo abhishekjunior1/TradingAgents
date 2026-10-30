@@ -224,6 +224,8 @@ MODEL_OPTIONS: ProviderModeOptions = {
     # The plan's models are listed live from OpenAI once signed in.
     "chatgpt": _CUSTOM_ONLY,
 }
+# A Claude plan through Claude Code serves the Claude models the plan includes.
+MODEL_OPTIONS["claude_code"] = MODEL_OPTIONS["anthropic"]
 
 
 def get_model_options(provider: str, mode: str) -> list[ModelOption]:

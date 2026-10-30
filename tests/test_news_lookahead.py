@@ -409,6 +409,13 @@ def test_a_flat_article_with_a_null_field_is_read_with_its_default(field):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("article", [{"title": "T", "relatedTickers": None},
+                                     {"content": {"title": "T"}, "relatedTickers": None}])
+def test_a_null_related_tickers_field_reads_as_no_tags(article):
+    assert ynews._extract_article_data(article)["related"] == []
+
+
+@pytest.mark.unit
 def test_one_malformed_article_does_not_lose_the_feed(monkeypatch):
     good = {"content": {"title": "Kept", "summary": "", "provider": {"displayName": "Wire"},
                         "pubDate": "2026-09-22T10:00:00Z"}}

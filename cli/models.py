@@ -8,6 +8,9 @@ class AnalystType(StrEnum):
     SOCIAL = "social"
     NEWS = "news"
     FUNDAMENTALS = "fundamentals"
+    # Intraday levels and a paper plan for one session; joins an intraday run by
+    # itself and is otherwise chosen by name, never by default.
+    DAY_TRADER = "day_trader"
 
 
 class AssetType(StrEnum):

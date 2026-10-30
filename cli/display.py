@@ -38,6 +38,7 @@ class MessageBuffer:
         "social": "Sentiment Analyst",
         "news": "News Analyst",
         "fundamentals": "Fundamentals Analyst",
+        "day_trader": "Day Trader",
     }
 
     # Report section mapping: section -> (analyst_key for filtering, finalizing_agent)
@@ -48,6 +49,7 @@ class MessageBuffer:
         "sentiment_report": ("social", "Sentiment Analyst"),
         "news_report": ("news", "News Analyst"),
         "fundamentals_report": ("fundamentals", "Fundamentals Analyst"),
+        "intraday_report": ("day_trader", "Day Trader"),
         "investment_plan": (None, "Research Manager"),
         "trader_investment_plan": (None, "Trader"),
         "final_trade_decision": (None, "Portfolio Manager"),
@@ -145,6 +147,7 @@ class MessageBuffer:
                 "sentiment_report": "Social Sentiment",
                 "news_report": "News Analysis",
                 "fundamentals_report": "Fundamentals Analysis",
+                "intraday_report": "Day Trader Plan",
                 "investment_plan": "Research Team Decision",
                 "trader_investment_plan": "Trading Team Plan",
                 "final_trade_decision": "Portfolio Management Decision",
@@ -214,6 +217,7 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
             "Sentiment Analyst",
             "News Analyst",
             "Fundamentals Analyst",
+            "Day Trader",
         ],
         "Research Team": ["Bull Researcher", "Bear Researcher", "Research Manager"],
         "Trading Team": ["Trader"],
@@ -391,6 +395,8 @@ def display_complete_report(final_state):
         analysts.append(("News Analyst", final_state["news_report"]))
     if final_state.get("fundamentals_report"):
         analysts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
+    if final_state.get("intraday_report"):
+        analysts.append(("Day Trader", final_state["intraday_report"]))
     if analysts:
         console.print(Panel("[bold]I. Analyst Team Reports[/bold]", border_style="cyan"))
         for title, content in analysts:
@@ -444,14 +450,16 @@ def update_research_team_status(status):
         message_buffer.update_agent_status(agent, status)
 
 
-# Ordered list of analysts for status transitions
-ANALYST_ORDER = ["market", "social", "news", "fundamentals"]
+# Ordered list of analysts for status transitions. A run keeps only the analysts
+# listed here (cli/run.py), so every analyst must be.
+ANALYST_ORDER = ["market", "social", "news", "fundamentals", "day_trader"]
 
 ANALYST_AGENT_NAMES = {
     "market": "Market Analyst",
     "social": "Sentiment Analyst",
     "news": "News Analyst",
     "fundamentals": "Fundamentals Analyst",
+    "day_trader": "Day Trader",
 }
 
 ANALYST_REPORT_MAP = {
@@ -459,6 +467,7 @@ ANALYST_REPORT_MAP = {
     "social": "sentiment_report",
     "news": "news_report",
     "fundamentals": "fundamentals_report",
+    "day_trader": "intraday_report",
 }
 
 

@@ -23,8 +23,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import tradingagents.default_config as default_config
 from tradingagents.agents.rating import RATING_REVIEW
 from tradingagents.dataflows.date_window import get_current_date
+from tradingagents.dataflows.router import TOOLS_CATEGORIES, VENDOR_METHODS
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.memory import TradingMemoryLog
@@ -127,6 +129,39 @@ class BacktestSummary:
         return "\n".join(lines)
 
 
+def _yahoo_serves(name: str) -> bool:
+    """Whether Yahoo serves the tool, or a tool of the category, that a vendor chain is set for."""
+    methods = TOOLS_CATEGORIES[name]["tools"] if name in TOOLS_CATEGORIES else [name]
+    return any("yfinance" in VENDOR_METHODS.get(method, {}) for method in methods)
+
+
+def _without_agent_reach(config: dict) -> tuple[dict, bool]:
+    """``config`` with Agent-Reach switched off and out of every vendor chain, and whether
+    it was on or named in one.
+
+    A chain it alone made up reads yfinance where Yahoo serves those tools, else
+    "default", which starts nothing while Agent-Reach is off (web_research). Chains
+    are read over the defaults, as a run reads them, so a news_data the environment
+    switched to Agent-Reach is caught too.
+    """
+    defaults = default_config.DEFAULT_CONFIG
+    found = bool(config.get("agent_reach_enabled", defaults.get("agent_reach_enabled")))
+    cleaned = {"agent_reach_enabled": False}
+    for key in ("data_vendors", "tool_vendors"):
+        chains = {**(defaults.get(key) or {}), **(config.get(key) or {})}
+        kept = {}
+        for name, chain in chains.items():
+            vendors = [v.strip() for v in str(chain).split(",") if v.strip()]
+            if "agent_reach" in vendors:
+                rest = [v for v in vendors if v != "agent_reach"]
+                chain = ",".join(rest) or ("yfinance" if _yahoo_serves(name) else "default")
+            kept[name] = chain
+        if kept != chains:
+            cleaned[key] = kept
+            found = True
+    return {**config, **cleaned}, found
+
+
 def _new_run(runs: Path) -> str:
     """A new run's id, stamped now, and its directory, claimed so no other sweep shares it."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -155,8 +190,15 @@ def run_backtest(
     The live log stays untouched: a sweep would otherwise flood the context that
     real runs read back. Cells already in this run's log are skipped, so an
     interrupted sweep resumes by being run again. ``progress(done, total,
-    ticker, date)`` is called before each cell that runs.
+    ticker, date)`` is called before each cell that runs. It scores swing
+    ratings only: an intraday horizon is refused before any cell runs. Agent-Reach
+    is never used: see ``_without_agent_reach``.
     """
+    if str(config.get("decision_horizon") or "swing").strip().lower() != "swing":
+        raise ValueError(
+            "The backtest scores swing ratings over the holding period; it does not replay intraday plans. "
+            "Set decision_horizon (TRADINGAGENTS_DECISION_HORIZON) to swing for a backtest."
+        )
     runs = Path(config["results_dir"]) / "backtest"
     if run_id:
         # run_id becomes a path segment, so it is validated like a ticker: an
@@ -166,8 +208,17 @@ def run_backtest(
     else:
         run_id = _new_run(runs)
     run_dir = runs / run_id
+    # A cell is a past decision, which AlphArena would fill at today's price: never sent.
     run_config = {**config, "results_dir": str(run_dir),
-                  "memory_log_path": str(run_dir / "trading_memory.md")}
+                  "memory_log_path": str(run_dir / "trading_memory.md"), "arena_enabled": False}
+    # Nor is a cell's news read through Agent-Reach: its web search has no date filter
+    # and pages give their own dates, and a sweep would run into Exa's limit for
+    # anonymous use.
+    run_config, dropped = _without_agent_reach(run_config)
+    if dropped:
+        logger.warning("Agent-Reach is not used in a backtest (its web search has no date filter, and a sweep "
+                       "would hit Exa's limit for anonymous use); news comes from %s.",
+                       (run_config.get("data_vendors") or {}).get("news_data") or "the configured vendors")
 
     graph = TradingAgentsGraph(selected_analysts, config=run_config)
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
@@ -212,6 +263,9 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
     else:
         raise FileNotFoundError(f"no memory log at {source}")
     entries = TradingMemoryLog({"memory_log_path": str(path)}).load_entries()
+    # An intraday plan is scored on its session's bars, not by alpha over the
+    # holding period, so a log holding both scores only the swing ratings.
+    entries = [e for e in entries if e.get("horizon") != "intraday"]
     # A decision with no readable rating has no direction, so it can neither
     # count for nor against the system; it is reported as unscored instead.
     resolved = [(e, _alpha(e)) for e in entries

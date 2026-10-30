@@ -5,7 +5,11 @@ from io import StringIO
 
 import pandas as pd
 
-from tradingagents.dataflows.errors import VendorNotConfiguredError, VendorUnavailableError
+from tradingagents.dataflows.errors import (
+    NoMarketDataError,
+    VendorNotConfiguredError,
+    VendorUnavailableError,
+)
 from tradingagents.dataflows.net import get_scrubbed
 
 API_BASE_URL = "https://www.alphavantage.co/query"
@@ -67,6 +71,21 @@ class AlphaVantageRateLimitError(VendorUnavailableError):
     pass
 
 
+def alpha_vantage_symbol(symbol: str) -> str:
+    """Yahoo's spelling of a listing, as Alpha Vantage takes it: BSE ``RELIANCE.BO`` is ``RELIANCE.BSE``.
+
+    Alpha Vantage does not cover NSE, so an ``.NS`` listing is refused as no data
+    for it, letting the router try the next configured vendor.
+    """
+    upper = symbol.strip().upper()
+    if upper.endswith(".BO"):
+        return upper[:-3] + ".BSE"
+    if upper.endswith(".NS"):
+        raise NoMarketDataError(symbol, symbol, "Alpha Vantage does not cover NSE listings; "
+                                "use yfinance, or the BSE listing (.BO)")
+    return symbol
+
+
 def _make_api_request(function_name: str, params: dict) -> dict | str:
     """Helper function to make API requests and handle responses.
 
@@ -76,6 +95,8 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
     # Create a copy of params to avoid modifying the original
     api_key = get_api_key()
     api_params = params.copy()
+    if isinstance(api_params.get("symbol"), str):
+        api_params["symbol"] = alpha_vantage_symbol(api_params["symbol"])
     api_params.update({
         "function": function_name,
         "apikey": api_key,

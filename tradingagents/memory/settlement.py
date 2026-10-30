@@ -9,6 +9,7 @@ import pandas as pd
 
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
+from tradingagents.memory import intraday_settlement
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,9 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
     Entries whose window has not traded yet are skipped; an entry whose prices
     or reflection could not be had stays pending and is reported as failed.
     With ``wait=False`` a pass already running elsewhere is left to do the work.
+    An intraday entry is replayed on its session's bars instead
+    (``intraday_settlement``), once that session's close is final; one whose
+    replay fails is reported the same way, and the rest still settle.
     """
     result = Settlement()
     with memory_log.settling(wait=wait) as held:
@@ -152,6 +156,20 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
             return result
         benchmark = resolve_benchmark(ticker, config)
         for entry in pending:
+            if entry.get("horizon") == "intraday":
+                try:
+                    status, reason = intraday_settlement.settle(ticker, entry, memory_log, reflector,
+                                                                config=config)
+                except Exception as exc:
+                    # One plan that cannot be replayed leaves the others, and later tickers, to settle.
+                    logger.warning("The intraday plan for %s on %s could not be settled: %s",
+                                   ticker, entry["date"], exc)
+                    status, reason = "failed", f"intraday settlement failed: {exc}"
+                if status == "settled":
+                    result.settled.append((ticker, entry["date"]))
+                elif status == "failed":
+                    result.failed.append((ticker, entry["date"], reason))
+                continue
             try:
                 raw, alpha, days, resolution_date = fetch_returns(
                     ticker, entry["date"], config.get("holding_period_days", 5), benchmark=benchmark,

@@ -10,6 +10,7 @@ from pathlib import Path
 import typer
 from rich.live import Live
 
+from cli.arena import check_before_run, offer_paper_trade
 from cli.display import (
     ANALYST_ORDER,
     AnalystWallTimeTracker,
@@ -28,9 +29,11 @@ from tradingagents.agents.rating import is_review, run_rating
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
+    analysts_for_horizon,
     build_analyst_execution_plan,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.reporting import horizon_line
 
 
 def _run_directory(config: dict, ticker: str, trade_date: str) -> Path:
@@ -89,6 +92,13 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
         if selections.get(key) is not None:
             config[key] = selections[key]
     config["output_language"] = selections.get("output_language", "English")
+    if selections.get("benchmark_ticker"):
+        config["benchmark_ticker"] = selections["benchmark_ticker"]
+    if selections.get("data_vendors"):
+        config["data_vendors"] = {**config["data_vendors"], **selections["data_vendors"]}
+    # --horizon for this run; without it the environment's horizon stays.
+    if selections.get("horizon"):
+        config["decision_horizon"] = selections["horizon"]
     # --checkpoint/--no-checkpoint overrides only when explicitly given; omitting
     # the flag preserves TRADINGAGENTS_CHECKPOINT_ENABLED / the default (#976).
     if checkpoint is not None:
@@ -111,12 +121,24 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
     selections = get_user_selections(flags)
 
     config = _build_run_config(selections, checkpoint)
+    # --arena/--no-arena for this run; without it TRADINGAGENTS_ARENA's setting stays.
+    if flags.get("arena") is not None:
+        config["arena_enabled"] = flags["arena"]
+    # With the arena on, say now when this decision could not be sent, and check the key
+    # it would need, rather than after the run has been paid for.
+    check_before_run(selections["ticker"], selections["analysis_date"], config,
+                     asset_type=selections.get("asset_type", "stock"), assume_yes=bool(flags.get("arena_yes")))
 
     stats_handler = StatsCallbackHandler()
 
     # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
     selected_set = {analyst.value for analyst in selections["analysts"]}
     selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
+    # An intraday run adds the Day Trader, as the graph does, so the display follows it too.
+    horizon = config.get("decision_horizon") or "swing"
+    if horizon == "intraday" and "day_trader" not in selected_analyst_keys:
+        console.print("[green]✓ Day Trader added:[/green] an intraday plan is grounded in its levels")
+    selected_analyst_keys = list(analysts_for_horizon(selected_analyst_keys, horizon))
     analyst_execution_plan = build_analyst_execution_plan(selected_analyst_keys)
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
@@ -219,6 +241,9 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
         init_agent_state = graph.create_run_state(
             selections["ticker"], selections["analysis_date"], selections["asset_type"], portfolio
         )
+        plan_for = horizon_line(init_agent_state)
+        if plan_for:
+            message_buffer.add_message("System", f"Decision horizon: {plan_for}")
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
         args = graph.propagator.get_graph_args(callbacks=[stats_handler])
@@ -384,6 +409,12 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
             "decision text below and judge it yourself.[/yellow]\n"
         )
     console.print(f"[dim]{analyst_wall_time_tracker.format_summary()}[/dim]")
+
+    # With arena_enabled on, the decision may go to AlphArena as a paper trade, asked
+    # here, outside the live view; the saved report then says what was sent.
+    arena_note = offer_paper_trade(final_state, config, assume_yes=bool(flags.get("arena_yes")))
+    if arena_note:
+        final_state = {**final_state, "arena_note": arena_note}
 
     _offer_reports(final_state, graph, selections["ticker"],
                    save=flags.get("save"), show=flags.get("show"), html=flags.get("html"))

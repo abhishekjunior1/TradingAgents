@@ -31,6 +31,7 @@ from urllib.request import Request, urlopen
 
 from tradingagents.dataflows.date_window import coverage_gap, in_window
 from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.markets.exchanges import exchange_for_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -83,14 +84,33 @@ DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 CRYPTO_SUBREDDITS = ("CryptoCurrency", "CryptoMarkets")
 _COIN_SUBREDDITS = {"BTC": "Bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
+# Indian stocks are discussed in Indian communities; the US ones above barely
+# name them. The largest active ones (member counts checked 2026-10).
+INDIA_SUBREDDITS = ("IndianStockMarket", "IndiaInvestments", "IndianStreetBets", "DalalStreetTalks")
+
 
 def subreddits_for(ticker: str) -> tuple[str, ...]:
-    """The subreddits searched for ``ticker``: crypto communities for a crypto pair."""
+    """The subreddits searched for ``ticker``: crypto communities for a crypto pair,
+    Indian ones for an NSE/BSE listing."""
     base = crypto_base(ticker)
-    if not base:
-        return DEFAULT_SUBREDDITS
-    coin = _COIN_SUBREDDITS.get(base)
-    return ((coin,) if coin else ()) + CRYPTO_SUBREDDITS
+    if base:
+        coin = _COIN_SUBREDDITS.get(base)
+        return ((coin,) if coin else ()) + CRYPTO_SUBREDDITS
+    if exchange_for_symbol(ticker) is not None:
+        return INDIA_SUBREDDITS
+    return DEFAULT_SUBREDDITS
+
+
+def search_term(ticker: str) -> str:
+    """What to search Reddit for: a crypto pair's base (``BTC``), an Indian listing's
+    symbol without its suffix (``RELIANCE``, as people write it), else the ticker."""
+    base = crypto_base(ticker)
+    if base:
+        return base
+    exchange = exchange_for_symbol(ticker)
+    if exchange is not None and ticker.upper().endswith(exchange.suffix):
+        return ticker[: -len(exchange.suffix)]
+    return ticker
 
 # Reddit's maximum page size. A week of posts for a ticker across the default
 # subreddits fits well inside one page, which keeps a high-volume subreddit from
@@ -273,9 +293,10 @@ def fetch_reddit_posts(
     per-subreddit cut, so the posts it keeps fill the slots.
     """
     subreddits = list(subreddits or subreddits_for(ticker))
-    # Crypto reaches us as a Yahoo pair (BTC-USD); search Reddit for the base
-    # ("BTC") so the query actually matches discussion instead of near-nothing.
-    ticker = crypto_base(ticker) or ticker
+    # Crypto reaches us as a Yahoo pair (BTC-USD) and an Indian stock with its
+    # suffix (RELIANCE.NS); search Reddit for the name people write ("BTC",
+    # "RELIANCE") so the query actually matches discussion instead of near-nothing.
+    ticker = search_term(ticker)
     label = ", ".join(f"r/{s}" for s in subreddits)
     fetched = _fetch_subreddit_rss(ticker, "+".join(subreddits), _FEED_PAGE, timeout)
     if fetched is None:
