@@ -23,8 +23,13 @@ from tradingagents.dataflows.vendors.yahoo.intraday import (
     load_intraday_with_meta,
 )
 from tradingagents.markets.exchanges import exchange_for_symbol, session_status
-from tradingagents.markets.intraday import intraday_cost_profile
-from tradingagents.markets.intraday_eval import IntradayOutcome, IntradayPlan, evaluate_plan
+from tradingagents.markets.intraday import intraday_cost_profile, tz_label
+from tradingagents.markets.intraday_eval import (
+    IntradayOutcome,
+    IntradayPlan,
+    _aligned,
+    evaluate_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,16 +66,47 @@ def session_closed(ticker: str, session: date, now: datetime) -> bool:
     return now.astimezone(UTC).date() > session
 
 
-def _session_range(bars: pd.DataFrame | None, session: date) -> str:
-    """The session's open, high, low and close from its bars, as one sentence; empty without bars."""
+def _range(day: pd.DataFrame) -> str:
+    return (f"open {price_text(float(day['Open'].iloc[0]))}, high {price_text(float(day['High'].max()))}, low "
+            f"{price_text(float(day['Low'].min()))}, close {price_text(float(day['Close'].iloc[-1]))}")
+
+
+def _session_range(bars: pd.DataFrame | None, session: date, made: pd.Timestamp | None = None) -> str:
+    """The session's open, high, low and close from its bars, as one sentence; empty without bars.
+
+    For a plan made during the session (``made``, on the bars' clock), the bars from then on,
+    which the replay used, and the whole session's high and low apart.
+    """
     if bars is None or not len(bars):
         return ""
     day = bars[pd.to_datetime(bars["Datetime"]).dt.date == session]
     if not len(day):
         return ""
-    return (f"The session traded: open {price_text(float(day['Open'].iloc[0]))}, high "
-            f"{price_text(float(day['High'].max()))}, low {price_text(float(day['Low'].min()))}, close "
-            f"{price_text(float(day['Close'].iloc[-1]))} ({SOURCE} {INTERVAL} bars).")
+    source = f"({SOURCE} {INTERVAL} bars)"
+    later = day[pd.to_datetime(day["Datetime"]) >= made] if made is not None else day
+    if len(later) == len(day):
+        return f"The session traded: {_range(day)} {source}."
+    if not len(later):
+        return (f"No bar of the session started after the plan was made at {_clock(made, session)}; before then "
+                f"it traded: {_range(day)} {source}.")
+    return (f"From {pd.to_datetime(later['Datetime']).iloc[0]:%H:%M}, after the plan was made, the session traded: "
+            f"{_range(later)} {source}; the whole session, with the trading before the plan, had high "
+            f"{price_text(float(day['High'].max()))} and low {price_text(float(day['Low'].min()))}.")
+
+
+def _made_at(plan: IntradayPlan, bars: pd.DataFrame | None) -> pd.Timestamp | None:
+    """When the plan was made (``valid_from``), on the bars' clock; None when its whole session counts."""
+    if plan.valid_from is None:
+        return None
+    if bars is None or not len(bars):
+        return pd.Timestamp(plan.valid_from)
+    return _aligned(plan.valid_from, pd.to_datetime(bars["Datetime"]).iloc[0])
+
+
+def _clock(moment: pd.Timestamp, session: date) -> str:
+    """``moment`` as HH:MM with its zone, and its date when that is not ``session``."""
+    when = f"{moment:%H:%M}" if moment.date() == session else f"{moment:%a %d %b %Y %H:%M}"
+    return f"{when} {tz_label(moment.tzinfo)}".strip() if moment.tzinfo is not None else when
 
 
 def _price(value) -> str:
@@ -78,12 +114,18 @@ def _price(value) -> str:
 
 
 def summarize(plan: IntradayPlan, outcome: IntradayOutcome, bars: pd.DataFrame | None, notes=()) -> str:
-    """The plan, what its replay did and the session's range, for the reflection prompt."""
+    """The plan, what its replay did and the session's range, for the reflection prompt.
+
+    A plan made during its session says when, and the range is the one it could trade.
+    """
     size = f"{plan.shares:,} shares" if plan.shares else "no share count (scored per share)"
     exit_by = f"exit by {plan.exit_by:%H:%M}" if plan.exit_by else "exit at the session close"
+    made = _made_at(plan, bars)
+    when = (f"when it was made, at {_clock(made, plan.session)} (bars before then are not used)" if made is not None
+            else "when it was made")
     lines = [f"Plan for {plan.session:%a %d %b %Y}: {plan.direction}, entry {_price(plan.entry)}, stop "
              f"{_price(plan.stop)}, target {_price(plan.target)}, {exit_by}, {size}; read against "
-             f"{_price(plan.reference_price)} when it was made."]
+             f"{_price(plan.reference_price)} {when}."]
     if not outcome.triggered:
         lines.append(f"Replay on the session's {INTERVAL} bars: no trade ({outcome.note or outcome.exit_reason}).")
     else:
@@ -95,7 +137,7 @@ def summarize(plan: IntradayPlan, outcome: IntradayOutcome, bars: pd.DataFrame |
             f"({outcome.net_return_pct:+.2f}% of the position at entry)"
             + (f", {outcome.r_multiple:+.2f}R." if outcome.r_multiple is not None else "; no stop, so no R multiple.")
         )
-    session_range = _session_range(bars, plan.session)
+    session_range = _session_range(bars, plan.session, made)
     if session_range:
         lines.append(session_range)
     if notes:

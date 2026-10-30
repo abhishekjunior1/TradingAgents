@@ -10,7 +10,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 from tradingagents.agents.rating import run_rating
+from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.markets.exchanges import exchange_for_symbol
+from tradingagents.markets.india import index_for
 
 # Every report ends with what it is: research by AI agents, with no real order placed.
 DISCLAIMER = (
@@ -24,13 +26,32 @@ INDIA_DISCLAIMER = (
 INTRADAY_DISCLAIMER = " An intraday plan is a paper exercise: it is not an order and is never sent to a broker."
 
 
-def market_line(ticker: str) -> str | None:
-    """The market a report's instrument trades on, for an exchange known here."""
+def market_line(ticker: str, final_state: dict | None = None, settings: dict | None = None) -> str | None:
+    """The market a report's instrument trades on, for an exchange known here, and its benchmark
+    (``benchmark_line``)."""
     exchange = exchange_for_symbol(ticker)
     if exchange is None:
         return None
     return (f"{exchange.name} ({exchange.code}); prices in {exchange.currency}; exchange time "
-            f"{exchange.tz_label} ({exchange.timezone}); benchmark {exchange.benchmark_name}")
+            f"{exchange.tz_label} ({exchange.timezone}); benchmark {benchmark_line(ticker, final_state, settings)}")
+
+
+def benchmark_line(ticker: str, final_state: dict | None = None, settings: dict | None = None) -> str | None:
+    """What the run's decision is measured against, for the report's header.
+
+    The run's own benchmark (``benchmark_ticker``, from --benchmark) when it set one,
+    else the listing's headline index; none for an intraday plan. None for a swing
+    run on a listing no exchange here knows, with no benchmark of its own.
+    """
+    if is_intraday_run(final_state or {}, settings):
+        return "none (an intraday plan is scored on its session's bars)"
+    explicit = (settings or {}).get("benchmark_ticker")
+    if explicit:
+        symbol = normalize_symbol(explicit)
+        index = index_for(symbol)
+        return (f"{index.name} ({symbol})" if index else symbol) + ", set for this run"
+    exchange = exchange_for_symbol(ticker)
+    return exchange.benchmark_name if exchange else None
 
 
 def disclaimer_for(ticker: str, intraday: bool = False) -> str:
@@ -44,7 +65,12 @@ def is_intraday_run(final_state: dict, settings: dict | None = None) -> bool:
 
 
 def horizon_line(final_state: dict, settings: dict | None = None) -> str | None:
-    """What an intraday run planned, for the report's header: its session and exit-by time; None for swing."""
+    """What an intraday run planned, for the report's header: its session and exit-by time; None for swing.
+
+    The exit-by is the plan's as stored and scored, with the configured square-off (intraday_square_off,
+    not necessarily the reader's broker's) named when the plan exits before it; before there is a plan
+    (the run's start), the square-off or the session close.
+    """
     if not is_intraday_run(final_state, settings):
         return None
     context = final_state.get("intraday_context") or {}
@@ -52,9 +78,12 @@ def horizon_line(final_state: dict, settings: dict | None = None) -> str | None:
         day = date.fromisoformat(str(context.get("session")))
     except ValueError:
         return "intraday paper plan (its session could not be worked out)"
-    exit_by = context.get("exit_by")
-    exit_text = (f"exit by {exit_by} {context.get('tz_label') or ''}".strip() if exit_by
-                 else "exit by the session close")
+    label = context.get("tz_label") or ""
+    square_off = context.get("exit_by")
+    exit_by = (final_state.get("intraday_plan") or {}).get("exit_by") or square_off
+    exit_text = f"exit by {exit_by} {label}".strip() if exit_by else "exit by the session close"
+    if exit_by and square_off and exit_by != square_off:
+        exit_text += " (the configured square-off is " + f"{square_off} {label}".strip() + ")"
     why = f" ({context['why']})" if context.get("why") else ""
     return f"intraday paper plan for {day:%a %d %b %Y}{why}; {exit_text}"
 
@@ -69,9 +98,12 @@ def _header(ticker: str, final_state: dict, settings: dict | None) -> str:
     lines = [f"# Trading Analysis Report: {ticker}", ""]
     if final_state.get("trade_date"):
         lines.append(f"- Analysis date: {final_state['trade_date']}")
-    market = market_line(ticker)
+    market = market_line(ticker, final_state, settings)
     if market:
         lines.append(f"- Market: {market}")
+    elif (settings or {}).get("benchmark_ticker"):
+        # No market line to name it in: the benchmark the run set gets a line of its own.
+        lines.append(f"- Benchmark: {benchmark_line(ticker, final_state, settings)}")
     if final_state.get("final_trade_decision"):
         lines.append(f"- Rating: {run_rating(final_state)}")
     lines.append(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

@@ -4,7 +4,8 @@ Pure: the caller hands over that session's bars once its close is final. A bar
 hides the order of the prices inside it, so every assumption leans against the
 plan: an order fills only when a bar reaches its price (at the bar's open when
 the bar opens beyond it), the bar that fills the entry is checked for the stop
-only, a bar that opens between the stop and the target and reaches both counts
+and then for the target by its close only (the one price sure to come after the
+fill), a bar that opens between the stop and the target and reaches both counts
 as stopped, and a stop gapped through exits at the bar's open. Charges come from
 markets/costs.py, as the caller configures them (``intraday_cost_profile``).
 
@@ -88,7 +89,7 @@ class IntradayOutcome:
     charges: float | None
     net_pnl: float | None
     net_return_pct: float | None         # net P&L as a percentage of the position's value at entry
-    r_multiple: float | None             # net P&L over the money risked between the fill and the stop
+    r_multiple: float | None             # net P&L over the money risked: entry to stop, or fill to stop if more
     shares: int | None = None
     entry_type: str | None = None        # "stop" (breakout / breakdown) or "limit" (pullback)
     note: str = ""
@@ -178,13 +179,15 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
     a buy limit for a long (a pullback) and a sell stop for a short. An entry
     equal to it is taken as a stop order, which never fills at a better price
     than the entry; with no reference price, the session's first open stands in.
-    An entry filled at an open already beyond the target exits there at once.
-    Once filled, later bars are checked bar by bar: a bar opening beyond the stop
+    An entry filled at an open already beyond the target exits there at once,
+    and one whose bar closes at or beyond the target exits at the target in that
+    bar. Once filled, later bars are checked bar by bar: a bar opening beyond the stop
     or the target exits at its open; otherwise a bar reaching both the stop and
     the target is stopped, and the target exits at its price. The position is closed at the open of the bar ``exit_by`` falls in, the
     first one ending after it (no entry fills from then on), or at the last
     bar's close. ``interval`` is the bars' length ("5m"); without it, the usual
-    gap between them. ``profile`` is a ``CostProfile`` or a name.
+    gap between them. ``profile`` is a ``CostProfile`` or a name. R is in the
+    risk the plan was sized on (entry to stop), or the fill's when that is more.
     """
     shares = plan.shares if plan.shares and plan.shares > 0 else None
     problem = plan_problem(plan.direction, plan.entry, plan.stop, plan.target)
@@ -194,10 +197,14 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
     if session.empty:
         return _no_trade("no_data", f"no bars for {plan.session:%d %b %Y}", shares)
     length = pd.Timedelta(minutes=_minutes(session, interval) or 0)
+    made = None          # when a plan made during its session was made, if that leaves bars out
     if plan.valid_from is not None:
-        session = session[session["Datetime"] >= _aligned(plan.valid_from, session["Datetime"].iloc[0])]
-        if session.empty:
+        since = _aligned(plan.valid_from, session["Datetime"].iloc[0])
+        later = session[session["Datetime"] >= since]
+        if later.empty:
             return _no_trade("not_triggered", "no bar starts after the plan was made", shares)
+        if len(later) < len(session):
+            made, session = since, later
 
     long = plan.direction == "long"
     reference = plan.reference_price if plan.reference_price is not None else float(session["Open"].iloc[0])
@@ -213,8 +220,14 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
         # square-off, so only its open is used.
         if plan.exit_by is not None and (start.time() >= plan.exit_by or (start + length).time() > plan.exit_by):
             if filled is None:
-                return _no_trade("not_triggered", f"the entry did not fill before the exit-by time "
-                                 f"{plan.exit_by:%H:%M}", shares, entry_type)
+                if made is not None and made.time() >= plan.exit_by:
+                    why = f"the exit-by time {plan.exit_by:%H:%M} had passed when the plan was made ({made:%H:%M})"
+                elif made is not None:
+                    why = (f"the entry did not fill between {made:%H:%M}, when the plan was made, and the exit-by "
+                           f"time {plan.exit_by:%H:%M}")
+                else:
+                    why = f"the entry did not fill before the exit-by time {plan.exit_by:%H:%M}"
+                return _no_trade("not_triggered", why, shares, entry_type)
             exit_at = (start, float(bar.Open), "exit_by")
             break
         if filled is None:
@@ -227,10 +240,15 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
             if target is not None and _reaches(price, target, long, against=False):
                 exit_at = (start, price, "target")
                 break
-            # The fill bar is checked for the stop only: its high and low may
+            # The fill bar is checked for the stop first: its high and low may
             # both have come after the fill.
             if stop is not None and _reaches(bar.Low if long else bar.High, stop, long, against=True):
                 exit_at = (start, min(stop, price) if long else max(stop, price), "stop")
+                break
+            # Its close did come after the fill: at or beyond the target, the
+            # price passed the resting target order on the way there.
+            if target is not None and _reaches(float(bar.Close), target, long, against=False):
+                exit_at = (start, target, "target")
                 break
             continue
         if stop is not None and _reaches(bar.Open, stop, long, against=True):
@@ -249,7 +267,9 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
             break
 
     if filled is None:
-        return _no_trade("not_triggered", "the session never reached the entry", shares, entry_type)
+        why = (f"the price never reached the entry after {made:%H:%M}, when the plan was made" if made is not None
+               else "the session never reached the entry")
+        return _no_trade("not_triggered", why, shares, entry_type)
     if exit_at is None:
         last = session.iloc[-1]
         exit_at = (last["Datetime"], float(last["Close"]), "session_close")
@@ -260,7 +280,12 @@ def evaluate_plan(plan: IntradayPlan, bars: pd.DataFrame | None, profile=None,
     gross = (exit_price - entry_price if long else entry_price - exit_price) * quantity
     charges = trade_charges(profile, long, entry_price, exit_price, quantity, venue)
     net = gross - charges
-    at_risk = (entry_price - stop if long else stop - entry_price) * quantity if stop is not None else None
+    at_risk = None
+    if stop is not None:
+        # A fill nearer the stop than the entry (a limit filled at a gap open) would leave next to
+        # nothing, or less, to divide by; a worse fill took on more risk than was planned.
+        planned, taken = (entry - stop, entry_price - stop) if long else (stop - entry, stop - entry_price)
+        at_risk = max(planned, taken) * quantity
     note = "" if shares else "per share: the plan gives no share count"
     if reason == "session_close":
         note = "; ".join(filter(None, [note, f"closed at the last bar's close ({exit_time:%H:%M})"]))

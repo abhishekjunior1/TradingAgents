@@ -33,6 +33,15 @@ tradingagents --horizon intraday --exchange nse --ticker TCS --date 2026-10-28  
 - Crypto is refused: it trades around the clock, and its sessions are not modelled.
 - A backtest refuses the intraday horizon: it scores swing ratings over the
   holding period and does not replay intraday plans.
+- A plan has no benchmark, so an intraday run neither checks nor uses
+  `--benchmark` or `TRADINGAGENTS_BENCHMARK_TICKER`: a value a swing run would
+  refuse does not stop it, and given `--benchmark` the CLI says "--benchmark
+  applies to swing decisions; this intraday run does not use it." The run's
+  portfolio risk figures, and for a listing outside NSE/BSE the market context's
+  Benchmark row, use the listing's index (NIFTY 50 or SENSEX, else the
+  `benchmark_map` index for its suffix, SPY for a US listing), as do
+  `tradingagents market` watchlist rows off NSE/BSE while
+  `TRADINGAGENTS_DECISION_HORIZON` is `intraday`.
 - Without a terminal, the run needs the same settings as any headless run (README,
   "CLI Usage"): `--ticker`, `--analysts`, `--save` or `--no-save`, `--show` or
   `--no-show`, and the `TRADINGAGENTS_*` provider, model, language and round
@@ -66,15 +75,24 @@ key levels, charges and what was unavailable, quoting only the report's numbers.
 - It runs only when you type it (`disable-model-invocation: true`), and it
   pre-approves only its own script, never `tradingagents login` or `logout`.
 - Set the headless settings in `.env` in this folder: `TRADINGAGENTS_LLM_PROVIDER`,
-  `TRADINGAGENTS_QUICK_THINK_LLM` or `TRADINGAGENTS_DEEP_THINK_LLM`,
+  `TRADINGAGENTS_QUICK_THINK_LLM` and `TRADINGAGENTS_DEEP_THINK_LLM` (with
+  `openai` one of them is enough, the other tier keeping its built-in model),
   `TRADINGAGENTS_OUTPUT_LANGUAGE`, `TRADINGAGENTS_MAX_DEBATE_ROUNDS`,
   `TRADINGAGENTS_MAX_RISK_ROUNDS`, and the provider's API key.
 - It runs `$TRADINGAGENTS_PYTHON -m cli.main` when `TRADINGAGENTS_PYTHON` is set
   (for example to this repository's `.venv/bin/python`), else the `tradingagents`
-  command on your PATH, else `python3 -m cli.main`. Export `TRADINGAGENTS_PYTHON`
-  before starting Claude Code: the script reads it from its environment, not
-  from `.env`. An older `tradingagents` on your PATH fails with "No such option:
-  --horizon"; set `TRADINGAGENTS_PYTHON` then.
+  command on your PATH, else this repository's `.venv/bin/python -m cli.main`,
+  else `python3 -m cli.main`. The Python it picks, `TRADINGAGENTS_PYTHON`
+  included, must be 3.11 or later, or the script stops before the run (it does
+  not try the next one), for example with
+  "day-trader: python3 is not Python 3.11 or later". The message suggests this
+  repository's `.venv/bin/python` unless the Python it refused is that one,
+  under whatever name or path; a `.venv` made with an older Python has to be
+  recreated with 3.11 or later. Export `TRADINGAGENTS_PYTHON` before starting
+  Claude Code: the script reads it from
+  its environment, not from `.env`, and reads a relative path from the folder it
+  is started in, so give the full path. An older `tradingagents` on your PATH
+  fails with "No such option: --horizon"; set `TRADINGAGENTS_PYTHON` then.
 - A run takes several minutes (often 5 to 15), which can exceed the 10-minute
   limit of Claude Code's Bash tool; the skill asks for the longest timeout, or a
   background run, and never retries on its own.
@@ -107,9 +125,15 @@ holidays and special sessions included); other listings count weekdays in their
 bars' time zone, with the hours their last five sessions' bars show, however few
 sessions the snapshot is asked for. Between the square-off time and the close, a
 run dated today still plans the rest of today's session, and the snapshot notes
-that the square-off has passed, so no new intraday position can be opened. The
-report header names the session and the exit-by time, for example "Horizon:
-intraday paper plan for <day> (<why>); exit by 15:10 IST".
+that the square-off has passed, so no new intraday position can be opened. When
+a run starts, before there is a plan, the CLI names the session and the
+square-off (the session close for other listings). The report header names the
+session and the plan's exit-by, with the configured square-off when the plan
+exits before it, for example "Horizon: intraday paper plan for Mon 02 Nov 2026
+(the next trading day after the analysis date Fri 30 Oct 2026); exit by 12:30
+IST (the configured square-off is 15:10 IST)"; for NSE/BSE its Market line ends
+"benchmark none (an intraday plan is scored on its session's bars)".
+complete_report.html gives the same in its run details.
 
 ## The Day Trader's snapshot
 
@@ -117,7 +141,20 @@ intraday paper plan for <day> (<why>); exit by 15:10 IST".
 5m and 5 by default) gives the Day Trader, as markdown tables:
 
 - the session the plan is for, why, and the exit-by (square-off) time;
-- the last complete session: open, high, low, close;
+- the last complete session: open, high, low, close, volume, and that volume
+  against the earlier sessions' in the bars. When the bars hold no session
+  before the plan's (`sessions=1` while that session trades), it comes from the
+  daily bar and is labelled dividend-adjusted, unless the instrument pays no
+  dividend: an index (a symbol with a caret, an Indian index Yahoo lists
+  without one, such as NIFTY_FIN_SERVICE.NS, or one of the default
+  `benchmark_map` indices Yahoo lists without one: 000001.SS, 399001.SZ,
+  FTSEMIB.MI), a currency pair, a future or a crypto pair, whose daily rows
+  Yahoo leaves as printed. When the bars' cut-off falls before its close
+  (BSE's 15-minute delay just after the close, for example), it is shown as
+  "Last session: Fri 30 Oct 2026, through 15:20 IST only": its
+  high, low, close and volume are marked not final, its volume is set against
+  the earlier sessions' to the same time, and the pivots from it are marked
+  "(not final)";
 - the plan's session so far, once it has traded: open, high, low, last, VWAP
   (typical price), volume, the gap from the previous close (at the first
   bar's open, and at the opening price the daily bar carries, which NSE and
@@ -125,18 +162,29 @@ intraday paper plan for <day> (<why>); exit by 15:10 IST".
   30-minute opening ranges, relative volume (volume so far against the average
   of the earlier sessions in the bars by the same time of day, leaving out a
   special session on other hours, such as Muhurat trading), and last versus
-  VWAP;
-- classic floor pivots (P, R1-R3, S1-S3) from the last complete session;
+  VWAP. Such a special session gets n/a for its own relative volume, both while
+  it trades (the row names its hours and the usual ones) and as the last
+  session. The gap at the opening price is measured against Yahoo's daily
+  close, which is dividend-adjusted for an instrument that pays dividends, and
+  its row and a note then say so: on an ex-dividend day it reads higher than the
+  gap that traded, by about the dividend yield. The gap at the first bar's open
+  uses the bars' own close, which is not adjusted (the daily bar's, labelled
+  dividend-adjusted in the same way, when the bars hold no earlier session);
+- classic floor pivots (P, R1-R3, S1-S3) from the last complete session,
+  labelled dividend-adjusted, as that session is, when it comes from the daily
+  bar;
 - ATR(14) on the bars and on daily bars;
 - paper sizing examples: a long and a short at the newest close, with stops 1x
   and 2x the bars' ATR away;
-- the latest 12 bars, and notes: the exchange hours in force on the date, the
-  feed delay, bars left out, and the capital used.
+- the latest 12 bars, and notes: the exchange hours in force on the date (on a
+  special session on other hours, that session's pre-open and trading hours),
+  the feed delay, bars left out, and the capital used.
 
 Every number names the bars it came from, and the snapshot is the source of
 truth for intraday prices, levels and sizes. The Day Trader also reads the
-verified market snapshot and the market context (benchmark, sector index, and for
-NSE/BSE India VIX, USD/INR and Brent).
+verified market snapshot and the market context (for NSE/BSE: NIFTY 50, SENSEX,
+NIFTY Bank, India VIX, the closest sector index, USD/INR and Brent; elsewhere only
+its listing's index, such as SPY for a US listing).
 
 **Paper sizing.** The share count is the largest whose loss at the stop plus the
 round-trip charges stays within the risk amount, `intraday_risk_pct` (0.5%) of
@@ -145,8 +193,16 @@ at floor(capital x `intraday_leverage_cap` / entry). The example reports the
 exposure, the margin needed at that leverage, the money at risk and the estimated
 round-trip charges (the configured ones, [Charges](#charges)). The capital is `intraday_paper_capital` (100,000 in the
 listing's currency, a paper notional, not an account balance). A `--portfolio`
-sets it to the book's value (long holdings at their last close plus cash) only
-when the whole book is in the listing's currency; the snapshot says which was used.
+sets it to the book's value on the analysis date (long holdings at their last
+close plus cash; a past-dated run leaves out the lots `acquired` after its date,
+while a run dated today counts every lot), but only for an NSE/BSE listing or a
+US one (a ticker with no suffix, such as AAPL), and only when the whole book is
+in its currency. NSE/BSE holdings count as INR, US ones as USD and a crypto pair
+as the currency or coin it is quoted in (ETH-BTC in BTC), whatever the book's
+label, so an INR book holding BTC-INR can be valued for an NSE trade and one
+holding BTC-USD or ETH-BTC cannot; other holdings and the cash count in the
+book's `currency`, and unlabelled cash in the listing's. The snapshot says which
+capital was used.
 
 ## The plan
 
@@ -167,7 +223,9 @@ none; plain numbers; HH:MM on a 24-hour clock), since they are read back.
   open (the calendar's for NSE/BSE, the bars' usual first bar elsewhere) or not
   after the moment a plan made during its session was made, is replaced by the
   square-off, or the session close, with a note. "3:55" meant as 3:55 pm reads
-  as 03:55.
+  as 03:55. When the square-off itself leaves no bar, because the plan was made
+  after it, a long or short gets a note that it cannot trade and is scored as
+  not triggered.
 - A direction the rating does not call for, or more shares than the paper sizing
   allows for that stop, is noted, not corrected. So is a long or short with no
   entry, or with its stop or target on the wrong side of the entry: it is scored
@@ -189,7 +247,8 @@ none; plain numbers; HH:MM on a 24-hour clock), since they are read back.
 ## Scoring the plan
 
 The plan goes into the memory log under `HORIZON: intraday`, as an
-`INTRADAY PLAN: <json>` line. A later run's Memory Log step (or
+`INTRADAY PLAN: <json>` line (a swing entry has its `BENCHMARK: <symbol>` line
+there instead). A later run's Memory Log step (or
 `ta.settle_all_pending()`) scores it once the session's close is final: for
 NSE/BSE after 16:00 IST on that day, elsewhere once the session's date is over in
 UTC and Yahoo's bars for it are final. It is replayed on that session's 5m bars,
@@ -202,10 +261,14 @@ never scored by the holding-period return:
 - **Fill** when a bar reaches the entry; a bar that opens beyond it fills at its
   open. A plan made in a run dated today, during its own session, counts only
   bars that start at or after the moment it was made (none when it was made
-  after the session). A run dated in the past plans as of that date's close, so
+  after the session), and a no-trade note for it gives that moment ("the price
+  never reached the entry after 13:05, when the plan was made") or says that no
+  bar starts after it. A run dated in the past plans as of that date's close, so
   its plan counts the whole session, whenever the run is made.
-- **The fill bar** is checked for the stop only, since its high and low may come
-  after the fill. A fill at an open already beyond the target (a gap through both)
+- **The fill bar** is checked for the stop first, since its high and low may
+  come after the fill, and then for the target by its close, the one price sure
+  to come after the fill: a close at or beyond the target exits at the target in
+  that bar. A fill at an open already beyond the target (a gap through both)
   exits there at once.
 - **Later bars**, one at a time: a bar opening beyond the stop or the target exits
   at its open, since the open comes first; otherwise a bar reaching the stop exits
@@ -223,7 +286,12 @@ The outcome (exit reason: target, stop, exit_by, session_close, not_triggered,
 no_plan or no_data; fill and exit; gross and net P&L, charges, net return and R
 multiple) is written as `INTRADAY OUTCOME: <json>`, the tag becomes
 `[date | ticker | rating | <net %> | n/a | intraday | resolved:<session>]`, and
-the model writes a short reflection. A session older than Yahoo's 5m window is
+the model writes a short reflection. The R multiple is the net P&L over the
+money risked between the planned entry and the stop, or between the fill and
+the stop when that is more. For a plan made during its session, the reflection
+is told when it was made and the range the session traded from then on, with
+the whole session's high and low marked as including the trading before the
+plan. A session older than Yahoo's 5m window is
 recorded as "Not scored: outside Yahoo's intraday window", and a session with no
 bars as not scored, both without a model call; so let a later run, or
 `settle_all_pending()`, settle a plan within about 60 days. Backtest summaries
@@ -284,8 +352,10 @@ intraday brokerage. Name another profile with `intraday_cost_profile`
 (`TRADINGAGENTS_INTRADAY_COST_PROFILE`), or `none` for no charges. The snapshot's
 sizing, the plan's size check and the later scoring all use these settings. A
 mistyped profile or field stops the run at its start. The swing settings
-`cost_profile` and `cost_overrides` do not apply here, and other listings carry
-no charges.
+`cost_profile` and `cost_overrides` do not apply here, though a mistyped one
+(or a mistyped capital-gains setting) stops an intraday run too, as it does any
+run ([docs/india.md](india.md#charges-and-tax-examples-configurable)), and other
+listings carry no charges.
 
 ### Leverage and margin
 
@@ -305,7 +375,7 @@ margin the position would tie up.
 
 - **How far back.** 1m bars for the last 7 days, 5m and 15m for the last 60,
   counting today. An older date gets "Yahoo serves 5m bars for about the last 60
-  days; <date> is outside that window (unavailable, not an absence of trading)",
+  days; ... is outside that window (unavailable, not an absence of trading)",
   and no request is made. (On 2026-10-29 Yahoo's chart API refused 1m requests
   longer than 8 days and 5m windows older than about 60 days.)
 - **No 30m bars.** yfinance builds them from 15m bars on clock half-hours, so
@@ -323,8 +393,17 @@ margin the position would tie up.
 - **Volumes and prices.** On 29 Oct 2026 an NSE stock's daily volume on Yahoo
   exceeded the sum of its 1m bars by about 2.3%, which fits the pre-open and
   post-close trades being left out of the bars (an inference).
-  Bars are not dividend-adjusted, and the official open and close can differ
-  slightly from the first and last bar.
+  Bars are not dividend-adjusted, while Yahoo's daily bars are for an
+  instrument that pays dividends. The snapshot reads the gap at the opening
+  price from them and, when the bars hold no earlier session, the last session,
+  its pivots and the gap at the first bar's open too; each is labelled
+  dividend-adjusted, and a note says what that means on an ex-dividend day:
+  prices about the dividend below those that traded, and gaps reading higher by
+  about the dividend yield. An index (a caret symbol, or an Indian or default
+  `benchmark_map` index without one, such as NIFTY_FIN_SERVICE.NS or
+  000001.SS), a currency pair (`=X`), a future (`=F`) or a crypto pair pays
+  no dividend, so its daily rows are as printed and carry no such label. The
+  official open and close can differ slightly from the first and last bar.
 - **Cache.** One file per symbol and interval under
   `<data_cache_dir>/intraday/` (default `~/.tradingagents/cache/intraday/`),
   holding the whole window. A file serves only the exchange-local day it was
@@ -352,8 +431,10 @@ value for TRADINGAGENTS_DECISION_HORIZON: expected swing or intraday, got 'day'"
 
 ## Limits
 
-- **One log entry per ticker per date**, across both horizons: a second run on
-  the same ticker and date, intraday or swing, is not logged.
+- **One log entry per ticker, date and horizon.** A swing rating and an
+  intraday plan for the same ticker and date are both logged and settled
+  their own ways; a second intraday run on the same ticker and date is not
+  logged, and the run warns that it will not be scored.
 - **Two clocks.** The run's default date is the earlier of your machine's date
   and the listing's, while the session is judged on the exchange's clock. On a
   machine in the US evening India's date is already the next day, so a run dated

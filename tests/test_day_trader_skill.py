@@ -29,15 +29,18 @@ INTRADAY_FLAGS = ["--horizon", "intraday", "--exchange", "nse", "--ticker", "REL
 # stand-in, so no real python3 or tradingagents can be picked up.
 TOOLS = ("bash", "dirname", "mktemp", "sed", "tr", "tail", "head", "cut", "wc", "awk", "rm")
 
-# The CLI's stand-in. It records how it was started, then does what STUB_MODE
-# says: "saved" writes STUB_FILES into a report folder and announces it with
-# rich, as cli/run.py does; "failed" ends like an unattended run missing a
-# setting; "unsaved" finishes without a report.
+# The CLI's stand-in. It passes the script's version check as a Python 3.11 or
+# later would. Run as the CLI, it records how it was started, then does what
+# STUB_MODE says: "saved" writes STUB_FILES into a report folder and announces
+# it with rich, as cli/run.py does; "failed" ends like an unattended run missing
+# a setting; "unsaved" finishes without a report.
 STUB = r'''
 import json, os, sys
 from pathlib import Path
 
 program, args = sys.argv[1], sys.argv[2:]
+if args[:1] == ["-c"]:   # the version check
+    sys.exit(0)
 watched = ("TRADINGAGENTS_NO_UPDATE_CHECK", "COLUMNS", "TYPER_STANDARD_TRACEBACK",
            "FORCE_COLOR", "PY_COLORS", "TTY_COMPATIBLE")
 Path(os.environ["STUB_RECORD"]).write_text(json.dumps({

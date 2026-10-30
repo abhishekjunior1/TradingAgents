@@ -4,7 +4,8 @@ videos, read a video's captions.
 A live page shows today's content, so a run dated in the past is refused one.
 Videos are dated by their upload (``youtube read``; search results carry no date):
 a past run lists or transcribes none uploaded after its date, a current run none
-uploaded after the machine's date (``cutoff``). Page text, titles,
+uploaded after the machine's date (``cutoff``), counting the run's listing's days
+(``date_window.window_zone``). Page text, titles,
 channel names and captions are third-party text: cleaned, cut, quoted and labelled
 as untrusted.
 """
@@ -14,9 +15,10 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlsplit
 
+from tradingagents.dataflows.date_window import window_zone
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.agent_reach.client import (
     MAX_URL_CHARS,
@@ -25,6 +27,7 @@ from tradingagents.dataflows.vendors.agent_reach.client import (
     count_setting,
     cutoff,
     in_dates,
+    local_day,
     one_line,
     published_date,
     quoted,
@@ -42,6 +45,10 @@ _LOCAL_HOSTS = frozenset({
     "local", "localdomain", "localhost", "metadata.google.internal",
 })
 _LOCAL_SUFFIXES = (".home.arpa", ".internal", ".lan", ".local", ".localdomain", ".localhost")
+
+# Markdown images, and links whose address holds at most one level of parentheses.
+_IMAGE = re.compile(r"!\[[^\[\]\n]*\]\((?:[^()\n]|\([^()\n]*\))*\)")
+_LINK = re.compile(r"\[([^\[\]\n]*)\]\((?:[^()\n]|\([^()\n]*\))*\)")
 
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 _VIDEO_URL = re.compile(
@@ -120,11 +127,31 @@ def _clock(seconds: int | None) -> str | None:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+def _page_text(text: str) -> str:
+    """Page text with images left out and links shown as their text.
+
+    Jina writes a page as markdown: on a news site the images, ad links and menus
+    before the article can take the whole character budget (on an Economic Times
+    article on 2026-10-30, 5,717 of the first 6,000 characters were link syntax).
+    """
+    return clean_text(_LINK.sub(r"\1", _IMAGE.sub("", text)))
+
+
+def _published(published: date) -> str:
+    """A page's date: with a time and zone, in the run's listing's zone and named so; else as the page gives it."""
+    if not isinstance(published, datetime):
+        return f"{published:%Y-%m-%d} (as the page states)"
+    if published.tzinfo is None:
+        return f"{published:%Y-%m-%d %H:%M} (as the page states, with no time zone)"
+    return f"{published.astimezone(window_zone() or UTC):%Y-%m-%d %H:%M %Z}"
+
+
 def read_web_page(url: str, as_of_date: str) -> str:
     """The text of the web page at ``url``, read through Agent-Reach (Jina Reader).
 
     A run dated in the past gets a refusal: a live page shows today's content,
     not what it said on the analysis date. Only a public http(s) URL is read.
+    Images are left out and links shown as their text (``_page_text``).
     """
     day, _, past = cutoff(as_of_date)
     if past:
@@ -138,13 +165,13 @@ def read_web_page(url: str, as_of_date: str) -> str:
     if not found:
         return f"No page found at {target} (Agent-Reach web read found nothing there)."
     page = found[0]
-    text = page["text"] or ""
+    text = _page_text(page["text"] or "")
     limit = count_setting("agent_reach_page_chars", 6000)
     published = published_date(page["published_at"])
     lines = [f"## Web page: {page['title'] or target}",
              f"Source: Agent-Reach web read (Jina Reader), {target}"]
     if published:
-        lines.append(f"Published: {published:%Y-%m-%d} (as the page states)")
+        lines.append(f"Published: {_published(published)}")
     lines += [UNTRUSTED_NOTE, ""]
     if not text:
         lines.append("The page returned no text.")
@@ -170,6 +197,7 @@ def get_video_coverage(
     counted; when it fails before any video is listed, the call raises.
     """
     day, end_dt, past = cutoff(as_of_date)
+    zone = window_zone()
     query = one_line(query, 200)
     if not query:
         return "Refused: give a search query."
@@ -204,10 +232,10 @@ def get_video_coverage(
             continue
         info = found[0]
         uploaded = published_date(info["published_at"])
-        if not in_dates(uploaded, start_dt, end_dt, past):
+        if not in_dates(uploaded, start_dt, end_dt, past, zone):
             outside += 1
             continue
-        listed.append((info, uploaded, vid))
+        listed.append((info, None if uploaded is None else local_day(uploaded, zone), vid))
 
     notes = []
     if outside:
@@ -256,10 +284,12 @@ def get_video_transcript(video: str, as_of_date: str) -> str:
     if uploaded is None and past:
         return (f"Refused: Agent-Reach gave no upload date for {url}, so it cannot be shown "
                 f"to be from on or before {day}.")
-    if uploaded is not None and uploaded.date() > end_dt.date():
-        if past:   # not when: a past-dated run is told nothing dated after its date
-            return f"Refused: {url} was uploaded after {day}."
-        return f"Refused: {url} was uploaded on {uploaded:%Y-%m-%d}, after {end_dt:%Y-%m-%d}."
+    if uploaded is not None:
+        uploaded = local_day(uploaded, window_zone())   # the day the run's listing counts it on
+        if uploaded > end_dt.date():
+            if past:   # not when: a past-dated run is told nothing dated after its date
+                return f"Refused: {url} was uploaded after {day}."
+            return f"Refused: {url} was uploaded on {uploaded:%Y-%m-%d}, after {end_dt:%Y-%m-%d}."
 
     captions = run("youtube", "subtitle", [url], {"lang": CAPTION_LANGS})["items"]
     text = (captions[0]["text"] or "") if captions else ""

@@ -21,11 +21,13 @@ from typing import Annotated, NoReturn
 
 import typer
 from rich import box
+from rich.console import Console
 from rich.markup import escape
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
 from cli.display import console
+from cli.tables import fit
 from tradingagents.arena import (
     AlphArenaClient,
     ArenaError,
@@ -62,9 +64,13 @@ def check_before_run(ticker: str, trade_date: str, config: dict, asset_type: str
     reason is printed and the analysis goes on: it is still useful. When it could, the key
     is checked now, with no request, rather than after a paid run: a missing key, or one
     for the other mode, ends the run before it starts, with exit code 2. The key is never
-    shown. The offer after the run checks everything again.
+    shown. The offer after the run checks everything again. With arena_enabled off, only
+    --arena-yes is remarked on: it will send nothing.
     """
     if not config.get("arena_enabled"):
+        if assume_yes:
+            _say("[dim]AlphArena is off for this run (--arena or TRADINGAGENTS_ARENA turns it on), "
+                 "so --arena-yes will send nothing.[/dim]")
         return
     with run_config(config):
         reason = refusal(ticker, trade_date, horizon=config.get("decision_horizon") or "swing",
@@ -374,7 +380,19 @@ def close(
 
 def _say(markup) -> None:
     """Print the CLI's own markup, with AlphArena's values escaped into it; emoji codes in those
-    values (":warning:") stay text too."""
+    values (":warning:") stay text too.
+
+    A table's values are never split or cut short. With no terminal (a pipe, a log, Claude
+    Code's Bash tool) rich would fit it to 80 columns, so it is printed at its own width; at a
+    terminal it is narrowed only as far as its values allow, else shown row by row (``fit``).
+    """
+    if isinstance(markup, Table):
+        if not console.is_terminal:
+            width = console.measure(markup, options=console.options.update_width(10_000)).maximum
+            Console(file=console.file, width=max(width, console.width), color_system=None,
+                    emoji=False).print(markup)
+            return
+        markup = fit(markup, console, console.options)
     console.print(markup, emoji=False)
 
 
@@ -404,7 +422,9 @@ def _list(value) -> list:
 
 
 def _table(*columns: str) -> Table:
-    return Table(*columns, header_style="bold magenta", box=box.SIMPLE_HEAD)
+    # A value too long for even a line of its own (``fit``) folds rather than ending in "…".
+    return Table(*(Column(column, overflow="fold") for column in columns), header_style="bold magenta",
+                 box=box.SIMPLE_HEAD)
 
 
 def _cells(*values) -> list[Text]:
@@ -414,8 +434,8 @@ def _cells(*values) -> list[Text]:
 
 def _pairs(title: str, pairs) -> Table:
     """Label and value rows; a value already made into ``Text`` is shown as it is."""
-    table = Table(show_header=False, box=None, title=title, title_justify="left", title_style="bold",
-                  padding=(0, 2))
+    table = Table(Column(overflow="fold"), Column(overflow="fold"), show_header=False, box=None, title=title,
+                  title_justify="left", title_style="bold", padding=(0, 2))
     for label, value in pairs:
         table.add_row(Text(label), value if isinstance(value, Text) else Text(_shown(value)))
     return table

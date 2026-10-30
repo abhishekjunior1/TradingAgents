@@ -355,7 +355,8 @@ def route_to_vendor(method: str, *args, **kwargs):
             last_unavailable = e
             continue
         except VendorNotConfiguredError as e:
-            logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
+            # The reason is what the user must fix (a wrong path, a bad setting); it carries no secret.
+            logger.warning("Vendor %r not configured for %s: %s; trying next vendor.", vendor, method, e)
             if first_error is None:
                 first_error = e  # Surface it if no other vendor can serve the call.
             continue

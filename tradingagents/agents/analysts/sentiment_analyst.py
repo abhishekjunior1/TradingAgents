@@ -3,7 +3,8 @@
 The node fetches its sources before calling the model and puts them in the
 prompt, so the model reports on data it was given rather than inventing posts:
 
-  1. News headlines: Yahoo Finance
+  1. News: the configured news vendor (Yahoo Finance by default; Agent-Reach's
+     web search first while it is switched on), labelled by what served it
   2. StockTwits messages: the cashtag stream, with Bullish/Bearish tags
   3. Reddit posts: r/wallstreetbets, r/stocks, r/investing, or crypto communities for a crypto pair
 
@@ -31,6 +32,8 @@ from tradingagents.agents.structured import (
     invoke_structured_or_freetext,
 )
 from tradingagents.agents.tools import get_news
+from tradingagents.dataflows.router import get_vendor
+from tradingagents.dataflows.vendors.agent_reach.client import UNTRUSTED_NOTE
 from tradingagents.dataflows.vendors.reddit import (
     CRYPTO_SUBREDDITS,
     DEFAULT_SUBREDDITS,
@@ -39,9 +42,28 @@ from tradingagents.dataflows.vendors.reddit import (
 )
 from tradingagents.dataflows.vendors.stocktwits import fetch_stocktwits_messages
 
+# The news vendors whose headlines come from news publishers.
+_NEWS_PUBLISHERS = {"yfinance": "Yahoo Finance", "alpha_vantage": "Alpha Vantage"}
+
 
 def _seven_days_back(trade_date: str) -> str:
     return (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+def _news_heading(news_block: str) -> str:
+    """The news block's heading, naming what served it.
+
+    Agent-Reach marks its web search results as untrusted: pages and blogs, which
+    must not be weighed as a news publisher's institutional headlines.
+    """
+    if UNTRUSTED_NOTE in news_block:
+        return ("### News — Agent-Reach web search results, past 7 days\n"
+                "Third-party web pages, blogs among them: unverified claims, not institutional reporting. "
+                "Weigh each by its source.")
+    chain = [v.strip() for v in get_vendor("news_data", "get_news").split(",")]
+    names = [_NEWS_PUBLISHERS[v] for v in chain if v in _NEWS_PUBLISHERS] or ["the configured news vendor"]
+    return (f"### News headlines — {' or '.join(names)}, past 7 days\n"
+            "Institutional framing. Fact-driven, slower-moving signal.")
 
 
 def create_sentiment_analyst(llm):
@@ -148,8 +170,7 @@ def _build_system_message(
 
 ## Data sources (pre-fetched, in this prompt)
 
-### News headlines — Yahoo Finance, past 7 days
-Institutional framing. Fact-driven, slower-moving signal.
+{_news_heading(news_block)}
 
 <start_of_news>
 {news_block}

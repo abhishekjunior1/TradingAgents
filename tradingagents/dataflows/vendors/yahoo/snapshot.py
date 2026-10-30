@@ -18,6 +18,16 @@ from stockstats import wrap
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import price_text
+from tradingagents.dataflows.vendors.yahoo.market import (
+    ADJUSTED_PRICES,
+    _forming,
+    _no_value,
+    _no_volume,
+    _no_volume_text,
+    _readings,
+    _session_now,
+    _short_history,
+)
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 
 # A fixed, common indicator set so the snapshot is the same shape every run.
@@ -80,9 +90,15 @@ def build_verified_market_snapshot(
     selected = tuple(indicators or DEFAULT_SNAPSHOT_INDICATORS)
     indicator_values: dict[str, str] = {}
     for name in selected:
+        # Too few rows still give stockstats a number (an RSI of 50, an ATR from one bar's range).
+        short = _short_history(name, len(df))
+        if short:
+            indicator_values[name] = short
+            continue
         try:
             stock_df[name]  # triggers stockstats calculation
-            indicator_values[name] = _fmt(stock_df.iloc[-1][name])
+            indicator_values[name] = (_no_volume_text(stock_df, name) if _no_volume(stock_df, name).iloc[-1]
+                                      else _fmt(_readings(stock_df, name).iloc[-1]))
         except Exception as exc:  # noqa: BLE001 — one bad indicator shouldn't sink the snapshot
             indicator_values[name] = f"N/A ({type(exc).__name__})"
 
@@ -90,15 +106,28 @@ def build_verified_market_snapshot(
     latest_date = _fmt(latest["Date"])
     window = max(1, min(int(look_back_days), 30))
     recent = df.tail(window)
+    exchange, status = _session_now(normalize_symbol(symbol))
+    forming = _forming(status, latest["Date"].date())
+    trading = (f" ({exchange.code}'s session still trading at {status.local_time:%H:%M} {exchange.tz_label}: its Close "
+               f"is the latest price, not a close; final after {exchange.close_final:%H:%M} {exchange.tz_label})"
+               if forming else "")
+    # Why the requested date has no row of its own (a holiday, today's bar not out yet, a gap),
+    # where an exchange calendar can tell; elsewhere a weekday without a row is only a guess.
+    requested = pd.to_datetime(as_of_date).date()
+    no_row = ([f"- No row for {as_of_date}: {_no_value(requested, exchange, status).removeprefix('N/A: ')}"]
+              if exchange is not None and latest["Date"].date() < requested else [])
 
     lines = [
         f"## Verified market data snapshot for {symbol.upper()}",
         "",
         f"- Requested analysis date: {as_of_date}",
-        f"- Latest trading row used: {latest_date}",
+        f"- Latest trading row used: {latest_date}{trading}",
+        *no_row,
+        f"- Daily rows behind the indicators: {len(df)}, from {_fmt(df['Date'].iloc[0])}",
         "- Rows after the requested analysis date are excluded before verification.",
+        f"- Prices: {ADJUSTED_PRICES}.",
         "",
-        "### Latest verified OHLCV row",
+        "### Latest OHLCV row (the session so far, not final)" if forming else "### Latest verified OHLCV row",
         "",
         "| Field | Value |",
         "|---|---:|",
@@ -106,8 +135,8 @@ def build_verified_market_snapshot(
     for field in ("Open", "High", "Low", "Close", "Volume"):
         lines.append(f"| {field} | {_fmt(latest.get(field))} |")
 
-    lines += ["", "### Verified technical indicators (latest row)", "",
-              "| Indicator | Value |", "|---|---:|"]
+    lines += ["", "### Technical indicators (latest row, provisional while the session trades)" if forming
+              else "### Verified technical indicators (latest row)", "", "| Indicator | Value |", "|---|---:|"]
     for name, value in indicator_values.items():
         lines.append(f"| {name} | {value} |")
 

@@ -10,7 +10,11 @@ from stockstats import wrap
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
-from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
+from tradingagents.dataflows.vendors.yahoo.ohlcv import (
+    _assert_ohlcv_not_stale,
+    _closed_day_filler,
+    load_ohlcv,
+)
 from tradingagents.markets.exchanges import (
     exchange_for_symbol,
     holiday_name,
@@ -27,7 +31,19 @@ _MIN_SESSIONS = {
     "macd": 26, "macds": 34, "macdh": 34, "rsi": 15,
     "boll": 20, "boll_ub": 20, "boll_lb": 20, "atr": 15, "vwma": 14, "mfi": 15,
 }
+# Sessions in stockstats' window for its volume-weighted indicators. With no volume
+# in the window there is no reading, yet stockstats gives one: VWMA 0.0, MFI 0.5.
+# Yahoo reports no volume at all for India VIX.
+_VOLUME_WINDOWS = {"vwma": 14, "mfi": 14}
+_NO_VOLUME = "N/A: no traded volume in this window (Yahoo reports none for this series)"
 _TRADING = ("pre-open", "open", "closing")
+
+# What the daily prices are, as get_stock_data and the snapshot serve them (``auto_adjust``,
+# yfinance's default), so they are not read as the exchange's closes.
+ADJUSTED_PRICES = ("adjusted by Yahoo for splits and dividends: rows dated before an ex-dividend date, even one "
+                   "after the dates asked for, are scaled down by that dividend, so they can sit below the "
+                   "exchange's printed prices and unadjusted figures such as the intraday bars or a quote's "
+                   "52-week range")
 
 
 def _session_now(canonical: str):
@@ -40,6 +56,29 @@ def _session_now(canonical: str):
 def _forming(status, day: date) -> bool:
     """Whether ``day``'s bar is a session still trading: its Close is the latest price, not a close."""
     return status is not None and status.state in _TRADING and day == status.local_time.date()
+
+
+def _readings(df, indicator: str) -> pd.Series:
+    """stockstats' computed ``indicator`` column as the tool reports it: MFI on the usual
+    0-100 scale its guidance (80/20) is written for, where stockstats gives 0-1."""
+    return df[indicator] * 100 if indicator == "mfi" else df[indicator]
+
+
+def _no_volume(df, indicator: str) -> pd.Series:
+    """Rows whose volume-weighted ``indicator`` window had no traded volume at all."""
+    window = _VOLUME_WINDOWS.get(indicator)
+    if window is None:
+        return pd.Series(False, index=df.index)
+    return df["volume"].fillna(0).rolling(window, min_periods=1).sum() <= 0
+
+
+def _no_volume_text(df, indicator: str) -> str:
+    """Why a reading ``_no_volume`` marks is N/A: Yahoo gives the series no volume at all
+    (India VIX), or only the sessions in this reading's window have none."""
+    if df["volume"].fillna(0).sum() <= 0:
+        return _NO_VOLUME
+    return (f"N/A: no volume reported in the {_VOLUME_WINDOWS[indicator]} sessions this reading weighs "
+            "(no trades, a suspension, or a gap in Yahoo's data)")
 
 
 def _short_history(indicator: str, rows: int) -> str | None:
@@ -65,15 +104,17 @@ def _no_value(day: date, exchange, status) -> str:
     return f"N/A: no price data from the vendor for this {exchange.code} trading day"
 
 
-def _range_notes(canonical: str, days: set[date], start_date: str, end_date: str) -> list[str]:
-    """Notes on an NSE/BSE listing's daily rows: a row of a session still trading, and
-    trading days the vendor returned no row for."""
+def _range_notes(canonical: str, days: set[date], start_date: str, end_date: str,
+                 dropped: set[date] = frozenset()) -> list[str]:
+    """Notes on an NSE/BSE listing's daily rows: a row of a session still trading,
+    trading days the vendor returned no row for, and filler rows left out for days
+    the exchange was closed (``dropped``)."""
     exchange, status = _session_now(canonical)
-    if exchange is None or not days:
+    if exchange is None or not (days or dropped):
         return []
     notes = []
-    newest = max(days)
-    if _forming(status, newest):
+    newest = max(days, default=None)
+    if newest is not None and _forming(status, newest):
         notes.append(f"the {newest:%Y-%m-%d} row is {exchange.code}'s session still trading at "
                      f"{status.local_time:%H:%M} {exchange.tz_label}: its Close is the latest price, not a close "
                      f"(final after {exchange.close_final:%H:%M} {exchange.tz_label})")
@@ -87,6 +128,10 @@ def _range_notes(canonical: str, days: set[date], start_date: str, end_date: str
         notes.append(f"no row for {len(missing)} of the {len(expected)} {exchange.code} trading days in this range "
                      f"({shown}): they are missing from Yahoo's data for this listing (or it had not listed yet), "
                      f"not holidays")
+    if dropped:
+        shown = ", ".join(f"{day:%d %b %Y} ({holiday_name(exchange, day) or 'weekend'})" for day in sorted(dropped))
+        notes.append(f"left out Yahoo's filler for {shown}, when {exchange.code} was closed: one price as open, "
+                     f"high, low and close and no volume, not a session")
     return notes
 
 
@@ -118,6 +163,10 @@ def get_YFin_data_online(
     if data.index.tz is not None:
         data.index = data.index.tz_localize(None)
 
+    filler = _closed_day_filler(data, canonical).to_numpy()
+    dropped = {stamp.date() for stamp in data.index[filler]}
+    data = data[~filler]
+
     # Reject a stale frame (e.g. a year-old partial response) before it is
     # formatted into the report. Raises NoMarketDataError, which the router
     # turns into one clear unavailable signal (#1021).
@@ -134,8 +183,9 @@ def get_YFin_data_online(
     label = canonical if canonical == symbol.upper() else f"{canonical} (from {symbol})"
     header = f"# Stock data for {label} from {start_date} to {end_date}\n"
     header += f"# Total records: {len(data)}\n"
+    header += f"# Prices: {ADJUSTED_PRICES}\n"
     days = {pd.Timestamp(stamp).date() for stamp in data.index}
-    header += "".join(f"# Note: {note}\n" for note in _range_notes(canonical, days, start_date, end_date))
+    header += "".join(f"# Note: {note}\n" for note in _range_notes(canonical, days, start_date, end_date, dropped))
 
     return header + "\n" + csv_string
 
@@ -300,15 +350,20 @@ def _get_stock_stats_bulk(
     df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
 
     df[indicator]  # This triggers stockstats to calculate the indicator
+    values = _readings(df, indicator).to_numpy()
+    idle = _no_volume(df, indicator).to_numpy()
+    no_volume = _no_volume_text(df, indicator) if idle.any() else None
 
     result_dict = {}
     for rows, (_, row) in enumerate(df.iterrows(), start=1):
         date_str = row["Date"]
-        indicator_value = row[indicator]
+        indicator_value = values[rows - 1]
 
         short = _short_history(indicator, rows)
         if short:
             result_dict[date_str] = short
+        elif idle[rows - 1]:
+            result_dict[date_str] = no_volume
         elif pd.isna(indicator_value):
             result_dict[date_str] = "N/A"
         else:
@@ -351,7 +406,10 @@ def get_closes(symbol: str, start_date: str, end_date: str) -> pd.Series:
     """Daily closes from ``start_date`` up to, not including, ``end_date``."""
     canonical = normalize_symbol(symbol)
     history = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_date))
-    return history["Close"] if history is not None and "Close" in history else pd.Series(dtype=float)
+    if history is None or "Close" not in history:
+        return pd.Series(dtype=float)
+    # Settlement counts these closes as sessions; a closed day's filler is not one.
+    return history.loc[~_closed_day_filler(history, canonical), "Close"]
 
 
 def get_stock_stats(
@@ -373,6 +431,11 @@ def get_stock_stats(
 
     if not matching_rows.empty:
         short = _short_history(indicator, int((df["Date"] <= as_of_str).sum()))
-        return short if short else matching_rows[indicator].values[0]
+        row = matching_rows.index[0]
+        if short:
+            return short
+        if _no_volume(df, indicator).loc[row]:
+            return _no_volume_text(df, indicator)
+        return _readings(df, indicator).loc[row]
     exchange, status = _session_now(normalize_symbol(symbol))
     return _no_value(pd.to_datetime(as_of_date).date(), exchange, status)

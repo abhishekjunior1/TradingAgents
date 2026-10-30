@@ -211,22 +211,35 @@ def get_news(
     return route_to_vendor("get_news", ticker, start_date, end_date)
 
 
+# The India section's text when Yahoo has no India searches to run.
+_NO_INDIA_SEARCHES = (
+    "No Yahoo news searches for India are configured (global_news_queries_india is empty). RBI policy, "
+    "the rupee, SEBI, the Union Budget and FII/DII flows are not covered by this vendor here: report "
+    "them as unavailable rather than inferring them."
+)
+
+
 @contextmanager
 def _news_searches_for(symbol: str):
     """For an NSE/BSE instrument, global news comes in two groups: India
     (``global_news_queries_india``, kept only when India-related) and Global
-    (``global_news_queries``, searched as for any other instrument)."""
+    (``global_news_queries``, searched as for any other instrument).
+
+    The groups are set even with no Yahoo India searches: a vendor with India
+    searches of its own (Agent-Reach's ``agent_reach_india_queries``) keys its
+    India section on them.
+    """
     config = get_config()
-    queries = config.get("global_news_queries_india") if exchange_for_symbol(normalize_symbol(symbol or "")) else None
-    if not queries:
+    if not exchange_for_symbol(normalize_symbol(symbol or "")):
         yield
         return
+    queries = list(config.get("global_news_queries_india") or [])
     groups = [
-        {"label": "India", "queries": list(queries), "fuzzy": bool(config.get("global_news_india_fuzzy")),
+        {"label": "India", "queries": queries, "fuzzy": bool(config.get("global_news_india_fuzzy")),
          "terms": list(config.get("global_news_india_terms") or []),
          "weak_terms": list(config.get("global_news_india_weak_terms") or []), "tickers": list(india.NEWS_TICKERS),
          "about": "Stories that mention India, or that Yahoo tags with an Indian listing, index or the rupee",
-         "empty": india.NEWS_GAP},
+         "empty": india.NEWS_GAP if queries else _NO_INDIA_SEARCHES},
         {"label": "Global", "queries": list(config["global_news_queries"]), "fuzzy": True,
          "about": "Global macro stories"},
     ]

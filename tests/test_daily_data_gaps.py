@@ -134,3 +134,33 @@ def test_a_complete_closed_range_has_no_notes(monkeypatch, clock):
     monkeypatch.setattr(yfin.yf, "Ticker", _yahoo(days))
 
     assert "# Note" not in yfin.get_YFin_data_online("TCS.NS", "2026-10-01", "2026-10-30")
+
+
+@pytest.mark.unit
+def test_the_verified_snapshot_gives_no_indicator_from_one_bar_and_marks_a_session_still_trading(monkeypatch, clock):
+    # Live on 30 Oct 2026 the snapshot gave RELIANCE.BO an ATR of 19.90 and an RSI of 50 from one bar.
+    from tradingagents.dataflows.vendors.yahoo import snapshot
+
+    monkeypatch.setattr(snapshot, "load_ohlcv", lambda symbol, as_of, fill_gaps=True: _daily(["2026-10-30"]))
+    text = snapshot.build_verified_market_snapshot("RELIANCE.BO", "2026-10-30")
+
+    assert ("- Latest trading row used: 2026-10-30 (BSE's session still trading at 13:30 IST: its Close is the "
+            "latest price, not a close; final after 16:00 IST)") in text
+    assert "- Daily rows behind the indicators: 1, from 2026-10-30" in text
+    assert "### Latest OHLCV row (the session so far, not final)" in text
+    assert "| rsi | N/A: not enough price history (rsi needs 15 sessions; the data has 1 through this date) |" in text
+    assert "| atr | N/A: not enough price history (atr needs 15 sessions; the data has 1 through this date) |" in text
+
+
+@pytest.mark.unit
+def test_the_verified_snapshot_of_a_closed_session_with_full_history_is_unchanged(monkeypatch, clock):
+    from tradingagents.dataflows.vendors.yahoo import snapshot
+
+    clock(CLOSED)
+    days = pd.bdate_range(end="2026-10-30", periods=250)
+    monkeypatch.setattr(snapshot, "load_ohlcv", lambda symbol, as_of, fill_gaps=True: _daily(days))
+    text = snapshot.build_verified_market_snapshot("TCS.NS", "2026-10-30")
+
+    assert "- Latest trading row used: 2026-10-30\n" in text and "still trading" not in text
+    assert "### Latest verified OHLCV row" in text and "### Verified technical indicators (latest row)" in text
+    assert "not enough price history" not in text

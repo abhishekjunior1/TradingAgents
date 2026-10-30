@@ -13,8 +13,10 @@ import json
 import logging
 import math
 from datetime import UTC, datetime
+from time import monotonic
 
 import requests
+from urllib3.exceptions import ConnectTimeoutError
 
 from tradingagents.dataflows.date_window import is_historical
 
@@ -22,19 +24,59 @@ logger = logging.getLogger(__name__)
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-# Network timeout (seconds), consistent with the other vendors.
-REQUEST_TIMEOUT = 30
+# Seconds to wait for a connection, then for the answer (the read timeout matches
+# the other vendors). urllib3 counts the TLS handshake (and a proxy's CONNECT) as
+# connecting, so a slow one needs room; a network that cannot reach Polymarket,
+# or stalls the handshake, waits this long once per RETRY_AFTER (see _request).
+CONNECT_TIMEOUT = 10
+READ_TIMEOUT = 30
+
+# Seconds after a failure to connect, or a timeout, during which requests fail at once.
+RETRY_AFTER = 300
 
 # Default number of markets to return, ranked by traded volume.
 DEFAULT_LIMIT = 6
 
+# When (``monotonic``) and how the last request failed to connect or timed out;
+# None until one has.
+_connect_failure: tuple[float, str] | None = None
+
 
 def _request(path: str, params: dict) -> dict:
-    response = requests.get(
-        f"{GAMMA_BASE}/{path}", params=params, timeout=REQUEST_TIMEOUT
-    )
+    """GET a Gamma endpoint.
+
+    After a failure to connect, or a timeout before Polymarket answers, requests within
+    ``RETRY_AFTER`` seconds raise at once: the news analyst asks about several topics
+    a run, and on 2026-10-30 each of them waited out a 30 s connect timeout to a
+    network that could not reach Polymarket. A timeout costs its whole wait each time,
+    and urllib3 reports a TLS handshake or a proxy's CONNECT that stalls as a read
+    timeout. A server that answers, even with an error, is asked again, and so is one
+    that drops the connection or rejects the TLS handshake: that fails at once.
+    """
+    global _connect_failure
+    if _connect_failure is not None:
+        ago = monotonic() - _connect_failure[0]
+        if ago < RETRY_AFTER:
+            raise requests.ConnectionError(
+                f"{_connect_failure[1]} {ago:.0f} s ago; not tried again for another {RETRY_AFTER - ago:.0f} s")
+    try:
+        response = requests.get(f"{GAMMA_BASE}/{path}", params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        if isinstance(exc, requests.Timeout) or _not_connected(exc):
+            # Not the error's text: it holds this request's address, with its topic.
+            _connect_failure = (monotonic(), f"a request to {GAMMA_BASE} failed ({type(exc).__name__})")
+        raise
     response.raise_for_status()
     return response.json()
+
+
+def _not_connected(exc: requests.ConnectionError) -> bool:
+    """Whether no connection was made, to Polymarket or the proxy: a connect timeout,
+    a refusal or an unknown host. urllib3 tells these apart the same way
+    (``Retry._is_connection_error``); its NewConnectionError is a ConnectTimeoutError."""
+    reason = getattr(exc.args[0], "reason", None) if exc.args else None
+    reason = getattr(reason, "original_error", reason)   # urllib3's ProxyError wraps it
+    return isinstance(exc, requests.ConnectTimeout) or isinstance(reason, ConnectTimeoutError)
 
 
 def _parse_json_list(value) -> list:

@@ -5,11 +5,13 @@ gives come from the pages, which can be wrong. A run dated in the past therefore
 keeps only items dated inside its window and drops undated ones; a current run also
 keeps undated items, marked as such. A past run keeps nothing dated after its date,
 and a current run nothing dated after the machine's date (``cutoff``), which in the
-night window can be a day after a US run's date. A search that keeps nothing raises
-NoMarketDataError, so the router tries the next vendor in the chain (Yahoo by
-default): with no date filter, finding nothing in a window is not an absence of
-news. Titles and snippets are third-party text: cleaned, cut, quoted and labelled
-as untrusted.
+night window can be a day after a US run's date. The days are the listing's
+(``date_window.window_zone``), and so are the dates shown, but a time with no zone
+is counted by ``client.local_day`` and shown on the date it states. A search that
+keeps nothing raises NoMarketDataError, so the router tries the next vendor in the
+chain (Yahoo by default): with no date filter, finding nothing in a window is not an
+absence of news. Titles and snippets are third-party text: cleaned, cut, quoted and
+labelled as untrusted.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.date_window import window_zone
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.symbols import crypto_base, normalize_symbol
 from tradingagents.dataflows.vendors.agent_reach.client import (
@@ -27,6 +30,7 @@ from tradingagents.dataflows.vendors.agent_reach.client import (
     count_setting,
     cutoff,
     in_dates,
+    local_day,
     one_line,
     published_date,
     run,
@@ -117,9 +121,10 @@ def _keys(item: dict) -> set[str]:
 
 
 def _in_window(items: list[dict], start_dt: datetime, end_dt: datetime, past: bool,
-               seen: set[str]) -> tuple[list[dict], int]:
-    """The items dated in the window (and, in a current run, the undated ones), each
-    with its parsed date as ``published``, and how many more repeated a story in ``seen``.
+               seen: set[str], zone=None) -> tuple[list[dict], int]:
+    """The items dated in the window, ``zone``'s days (and, in a current run, the
+    undated ones), each with its day there as ``published`` (a time with no zone,
+    the date it states), and how many more repeated a story in ``seen``.
 
     ``seen`` gains the kept stories' keys, so searches made in turn share no story.
     """
@@ -127,18 +132,22 @@ def _in_window(items: list[dict], start_dt: datetime, end_dt: datetime, past: bo
     for item in items:
         published = published_date(item["published_at"])
         keys = _keys(item)
-        if not keys or not in_dates(published, start_dt, end_dt, past):
+        if not keys or not in_dates(published, start_dt, end_dt, past, zone):
             continue
         if keys & seen:
             repeats += 1
             continue
         seen |= keys
-        kept.append({**item, "published": published})
+        if isinstance(published, datetime) and published.tzinfo is None:
+            # Counted by local_day (the next day in India for an evening time), but
+            # shown on the date the page states, as read_web_page shows it.
+            published = published.date()
+        kept.append({**item, "published": None if published is None else local_day(published, zone)})
     return kept, repeats
 
 
 def _search(queries, per_search: int, limit: int, start_dt: datetime, end_dt: datetime,
-            past: bool, seen: set[str]) -> tuple[list[dict], int, list[str]]:
+            past: bool, seen: set[str], zone=None) -> tuple[list[dict], int, list[str]]:
     """Up to ``limit`` stories in the window from web searches for ``queries`` in turn,
     how many more repeated stories already kept, and the queries searched.
 
@@ -152,7 +161,7 @@ def _search(queries, per_search: int, limit: int, start_dt: datetime, end_dt: da
             continue
         searched.append(query)
         found = run("web", "search", [query], {"limit": per_search})["items"]
-        kept, repeated = _in_window(found, start_dt, end_dt, past, seen)
+        kept, repeated = _in_window(found, start_dt, end_dt, past, seen, zone)
         stories += kept
         repeats += repeated
         if len(stories) >= limit:
@@ -228,7 +237,7 @@ def get_news_agent_reach(ticker: str, start_date: str, end_date: str) -> str:
     _, end_dt, past = cutoff(end_date, canonical)
     query = _search_query(canonical)
     found = run("web", "search", [query], {"limit": 2 * count_setting("agent_reach_max_results", 5)})["items"]
-    stories, _ = _in_window(found, start_dt, end_dt, past, set())
+    stories, _ = _in_window(found, start_dt, end_dt, past, set(), window_zone(canonical))
     if not stories:
         raise NoMarketDataError(ticker, canonical, _kept_none(
             f'{SOURCE} result for "{query}"', start_date, end_date, past))
@@ -265,6 +274,7 @@ def get_global_news_agent_reach(
     start_dt = datetime.strptime(as_of_date, "%Y-%m-%d") - timedelta(days=look_back_days)
     start_date = start_dt.strftime("%Y-%m-%d")
     _, end_dt, past = cutoff(as_of_date)
+    zone = window_zone()   # the run's listing's days
     per_search = 2 * count_setting("agent_reach_max_results", 5)
     snippet_chars = count_setting("agent_reach_snippet_chars", 600)
     global_queries = list(config.get("global_news_queries") or [])
@@ -278,10 +288,10 @@ def get_global_news_agent_reach(
         # Each group is searched to the whole limit, so a share another group
         # leaves unused can be filled; stories are not repeated across groups.
         seen: set[str] = set()
-        found = [_search(g["queries"], per_search, limit, start_dt, end_dt, past, seen) for g in groups]
+        found = [_search(g["queries"], per_search, limit, start_dt, end_dt, past, seen, zone) for g in groups]
         news_str = _format_groups(groups, found, limit, snippet_chars)
     else:
-        stories, _, _ = _search(global_queries, per_search, limit, start_dt, end_dt, past, set())
+        stories, _, _ = _search(global_queries, per_search, limit, start_dt, end_dt, past, set(), zone)
         news_str = _format_items(stories[:limit], snippet_chars)
 
     if not news_str:

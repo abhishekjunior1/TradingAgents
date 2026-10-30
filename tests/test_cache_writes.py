@@ -45,6 +45,9 @@ def test_the_price_cache_is_replaced_whole(monkeypatch, tmp_path):
                           "Low": 1.0, "Close": 1.0, "Volume": 1})
     monkeypatch.setattr(ohlcv, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
     monkeypatch.setattr(ohlcv.yf, "Ticker", lambda s: type("T", (), {"history": lambda self, **k: frame.set_index("Date")})())
+    # The file is named for the year its download starts in when today's 5-year window does
+    # not reach far enough behind the date asked for, so the clock is fixed.
+    monkeypatch.setattr(ohlcv.pd.Timestamp, "today", staticmethod(lambda: pd.Timestamp("2026-01-06 18:00")))
     moves = _recording_replace(monkeypatch)
 
     ohlcv.load_ohlcv("AAPL", "2026-01-06")

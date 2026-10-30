@@ -7,11 +7,26 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
+from tradingagents.markets.exchanges import exchange_for_symbol
+from tradingagents.markets.india import INDICES, index_for
 from tradingagents.memory import intraday_settlement
 
 logger = logging.getLogger(__name__)
+
+# Never a benchmark, nor offered as one: a volatility index has no return to measure a decision against.
+# India VIX, and the others under Yahoo's symbols: Cboe's on the S&P 500 (VIX at each term, by its current
+# and former names, and the volatility of VIX), on other indices, ETFs, stocks, gold, oil, the euro and
+# Treasuries, and those on the Hang Seng, the Nikkei 225, the ASX 200 and the EURO STOXX 50.
+_NOT_A_BENCHMARK = frozenset({
+    "^INDIAVIX",
+    "^VIX", "^VIX1D", "^VIX9D", "^VIX3M", "^VIX6M", "^VIX1Y", "^VXST", "^VXV", "^VXMT", "^VVIX",
+    "^VXN", "^VXD", "^RVX", "^VXO", "^VXEEM", "^VXEFA", "^VXEWZ", "^VXFXI", "^VXGDX", "^VXSLV", "^VXXLE",
+    "^VXAPL", "^VXAZN", "^VXGOG", "^VXGS", "^VXIBM", "^GVZ", "^OVX", "^EVZ", "^VXTLT", "^MOVE",
+    "^VHSI", "^JNIV", "^AXVI", "V2TX.DE",
+})
 
 
 def resolve_benchmark(ticker: str, config: dict) -> str:
@@ -19,10 +34,13 @@ def resolve_benchmark(ticker: str, config: dict) -> str:
 
     ``config["benchmark_ticker"]`` overrides everything when set; otherwise
     the suffix map matches the ticker's exchange suffix (e.g. ``.T`` for
-    Tokyo). US-listed tickers without a dotted suffix fall through to the
-    empty-suffix entry (SPY by default). Unrecognised suffixes, including
-    US tickers with dots like ``BRK.B``, also take the empty-suffix entry.
-    Returns are compared as percentages, each in its own currency.
+    Tokyo), and an NSE/BSE index (``^NSEBANK``) takes its exchange's
+    headline index (NIFTY 50, SENSEX; the headline index itself has no
+    alpha, as SPY has none against SPY). US-listed tickers without a dotted
+    suffix fall through to the empty-suffix entry (SPY by default).
+    Unrecognised suffixes, including US tickers with dots like ``BRK.B``,
+    also take the empty-suffix entry. Returns are compared as percentages,
+    each in its own currency.
     """
 
     explicit = config.get("benchmark_ticker")
@@ -35,7 +53,86 @@ def resolve_benchmark(ticker: str, config: dict) -> str:
     for suffix, benchmark in benchmark_map.items():
         if suffix and ticker_upper.endswith(suffix.upper()):
             return benchmark
+    # An index has no listing suffix, but its exchange is known here.
+    exchange = exchange_for_symbol(ticker_upper)
+    if exchange is not None:
+        return exchange.benchmark
     return benchmark_map.get("", "SPY")
+
+
+def check_benchmark(benchmark: str, config: dict, as_of: str | None = None, seen: dict | None = None) -> str:
+    """``benchmark`` as the Yahoo symbol decisions are measured against, once Yahoo is known to price it.
+
+    A decision stored with a benchmark that has no prices could never be settled,
+    and a volatility index (India VIX, VIX and the others in ``_NOT_A_BENCHMARK``)
+    has no return to score it against: both are refused. An index Yahoo keeps no
+    history for (NIFTY Midcap 100) is refused without asking. An index listed here
+    with a daily history, or a ``benchmark_map`` value, is priced lately, and taken
+    as it is unless ``as_of`` is older than 30 days: Yahoo's history of several NSE
+    indices starts in 2010-2011. Any other symbol, and one of those at such a date,
+    needs a Yahoo close in the 30 days to ``as_of``, the run's date (today when not
+    given): a past-dated run needs prices at its own date. ``seen``, a dict the
+    caller keeps, holds the closes already fetched, so a graph's later checks (a
+    run's date, its decision once recorded, a backtest's next cell) are answered
+    from them. Raises ValueError naming the choices, or VendorUnavailableError when
+    Yahoo could not be asked.
+    """
+    symbol = normalize_symbol(benchmark)
+    index = index_for(symbol)
+    choices = ", ".join(i.name for i in INDICES if i.history and i.symbol not in _NOT_A_BENCHMARK)
+    choose = f"Choose an index with a daily history ({choices}) or another symbol Yahoo prices, such as SPY."
+    if symbol in _NOT_A_BENCHMARK:
+        name = f"{index.name} ({symbol})" if index is not None else symbol
+        raise ValueError(f"{name} is a volatility index, which has no return to measure a decision against, "
+                         f"so it cannot be a benchmark. {choose}")
+    if index is not None and not index.history:
+        raise ValueError(f"Yahoo Finance keeps no daily history for {index.name} ({symbol}), so no decision "
+                         f"could be settled against it as a benchmark. {choose}")
+    today = _now().tz_localize(None).normalize()
+    day = pd.Timestamp(as_of) if as_of else today
+    listed = index is not None or symbol in set((config.get("benchmark_map") or {}).values())
+    if listed and day >= today - timedelta(days=30):
+        return symbol
+    try:
+        if _priced(symbol, day, seen):
+            return symbol
+    except VendorUnavailableError as exc:
+        raise VendorUnavailableError(f"the benchmark {symbol} could not be checked: {exc}") from exc
+    reason = (f"Yahoo Finance has no prices for {symbol!r} in "
+              + (f"the 30 days to {as_of}" if as_of else "the last 30 days"))
+    raise ValueError(f"{reason}, so no decision could be settled against it as a benchmark. {choose}")
+
+
+def _priced(symbol: str, day: pd.Timestamp, seen: dict | None) -> bool:
+    """Whether Yahoo has a close for ``symbol`` in the 30 days to ``day``.
+
+    The closes are fetched from the window's start through today and kept in
+    ``seen`` (when given) with the span asked for, so a later date (a backtest's
+    next cell) or the same one (the run's decision, once recorded) is answered
+    from them.
+    """
+    start, today = day - timedelta(days=30), _now().tz_localize(None).normalize()
+
+    def found(closes):
+        if closes.empty:
+            return False
+        dates = closes.index.tz_localize(None) if getattr(closes.index, "tz", None) else closes.index
+        return bool(((dates >= start) & (dates < day + timedelta(days=1))).any())
+
+    held = (seen or {}).get(symbol)
+    if held is not None:
+        span_start, span_end, closes = held
+        if found(closes):
+            return True
+        if span_start <= start and day < span_end:
+            return False    # that window was asked for: it has no close
+    end = max(day, today) + timedelta(days=1)
+    closes = get_closes(symbol, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    closes = closes[closes > 0]
+    # An answer with no closes at all is not kept: the next check asks again.
+    if seen is not None and not closes.empty:
+        seen[symbol] = (start, end, closes)
+    return found(closes)
 
 
 def _now() -> pd.Timestamp:
@@ -72,8 +169,9 @@ def fetch_returns(
     holding_days, resolution_date)`` — where ``resolution_date`` is the date
     of the last price bar used, i.e. when the outcome became known (#1251) —
     or ``(None, None, None, None)`` when the full holding window has not traded
-    yet (#1169). A failure to get or read the prices is raised, for the caller
-    to report.
+    yet (#1169). A failure to get or read the prices, or a benchmark with no
+    closes at all once the window has traded, or none on or before the entry
+    session (a symbol listed since), is raised, for the caller to report.
     """
     start = datetime.strptime(trade_date, "%Y-%m-%d")
     today = _now().tz_localize(None).normalize()
@@ -108,12 +206,21 @@ def fetch_returns(
     # premature partial return (#1169).
     if len(stock) <= holding_days:
         return None, None, None, None
+    # A symbol Yahoo has no closes for (a mistyped --benchmark) will not trade
+    # later: waiting would keep the decision pending for good, unexplained.
+    if bench.empty:
+        raise ValueError(f"no closes for the benchmark {benchmark}")
     entry, exit_ = stock.index[0], stock.index[holding_days]
     # The window is the stock's own sessions; the benchmark is valued at its
     # last close by each end, so both returns span the same dates even when
     # the calendars differ (a coin trades at weekends, an index does not).
+    # Its closes from a week before the decision start after the entry: that
+    # past will not change, so waiting would keep the decision pending for good.
+    if bench.index[0] > entry:
+        raise ValueError(f"no close for the benchmark {benchmark} on or before the entry session "
+                         f"{entry:%Y-%m-%d}")
     # It must have traded through the exit, or its close there may yet move.
-    if bench.empty or bench.index[0] > entry or bench.index[-1] < exit_:
+    if bench.index[-1] < exit_:
         return None, None, None, None
 
     raw = float((stock.iloc[holding_days] - stock.iloc[0]) / stock.iloc[0])
@@ -143,6 +250,9 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
     Entries whose window has not traded yet are skipped; an entry whose prices
     or reflection could not be had stays pending and is reported as failed.
     With ``wait=False`` a pass already running elsewhere is left to do the work.
+    Each decision is measured against the benchmark recorded with it, the one
+    its own run chose; one recorded without takes its listing's, never the
+    settling run's ``benchmark_ticker``, which is for that run's decision.
     An intraday entry is replayed on its session's bars instead
     (``intraday_settlement``), once that session's close is final; one whose
     replay fails is reported the same way, and the rest still settle.
@@ -154,7 +264,7 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
         pending = [e for e in memory_log.get_pending_entries() if e["ticker"] == ticker]
         if not pending:
             return result
-        benchmark = resolve_benchmark(ticker, config)
+        listing_benchmark = resolve_benchmark(ticker, {**config, "benchmark_ticker": None})
         for entry in pending:
             if entry.get("horizon") == "intraday":
                 try:
@@ -170,6 +280,7 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
                 elif status == "failed":
                     result.failed.append((ticker, entry["date"], reason))
                 continue
+            benchmark = entry.get("benchmark") or listing_benchmark
             try:
                 raw, alpha, days, resolution_date = fetch_returns(
                     ticker, entry["date"], config.get("holding_period_days", 5), benchmark=benchmark,
@@ -180,12 +291,18 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
                 continue
             if raw is None:
                 continue  # the holding window has not traded yet: try again next run
+            # An instrument measured against itself (NIFTY 50, SENSEX, SPY) has an alpha of zero by
+            # construction; the reflection is told so, and to judge the call on its raw return.
+            label = benchmark
+            if normalize_symbol(benchmark) == normalize_symbol(ticker):
+                label = (f"{benchmark} (the instrument itself, so this alpha is zero by construction; "
+                         "judge the call on the raw return above)")
             try:
                 reflection = reflector.reflect_on_final_decision(
                     final_decision=entry.get("decision", ""),
                     raw_return=raw,
                     alpha_return=alpha,
-                    benchmark_name=benchmark,
+                    benchmark_name=label,
                     holding_days=days,
                 )
             except Exception as exc:
@@ -194,8 +311,10 @@ def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool 
                 logger.warning("Reflection failed for %s on %s: %s", ticker, entry["date"], exc)
                 result.failed.append((ticker, entry["date"], f"reflection failed: {exc}"))
                 continue
+            # The benchmark goes with the outcome: one recorded before benchmarks were has it written, so
+            # its lesson names it and a backtest can tell an instrument measured against itself.
             if memory_log.update_with_outcome(ticker, entry["date"], raw, alpha, days, reflection,
-                                              resolution_date=resolution_date):
+                                              resolution_date=resolution_date, benchmark=benchmark):
                 result.settled.append((ticker, entry["date"]))
     return result
 

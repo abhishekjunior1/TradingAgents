@@ -124,14 +124,15 @@ sent, the CLI says why and the analysis goes on. When it could, the CLI checks,
 without a request, that `ALPHARENA_API_KEY` is set and is a key for `arena_mode`
 (`aa_test_` in sandbox mode, `aa_live_` in live); if not, it stops before anything
 is analysed, with exit code 2: set the key, or rerun with `--no-arena`. The key
-is never shown. After the run everything is checked again.
+is never shown. `--arena-yes` does not turn the arena on: with the arena off, the
+CLI says before the analysis that it will send nothing, and the analysis goes on.
+After the run everything is checked again.
 
 Backtests never send anything, and neither does `TradingAgentsGraph.propagate()`:
 the offer is part of the CLI only. From Python, call
 `tradingagents.arena.propose_plan` and `send_plan` yourself; `propose_plan`
 refuses what the CLI refuses, an intraday run included (it reads the run's
-horizon from its state). `--arena-yes` alone
-does not turn the arena on. The `/day-trader` skill never reaches it: its runs
+horizon from its state). The `/day-trader` skill never reaches it: its runs
 are intraday, on NSE/BSE, and without a terminal.
 
 ## What a decision becomes
@@ -209,6 +210,13 @@ tradingagents arena close AAPL [--yes]                           # close every o
 trades on AlphArena (simulated money)? [y/N]" unless `--yes`, and records each
 close in the ledger; AlphArena closes a trade in full, at its own price. Figures
 are shown as AlphArena reports them.
+
+The tables of `status`, `leaderboard` and `trades` are never cut to fit the
+terminal, though AlphArena's text in them (an agent's name, say) is shortened to
+at most 40 characters. With no terminal (a pipe, a log, Claude Code's Bash tool)
+they are printed at their full width. At a terminal too narrow for a table, its
+columns narrow only as far as their values allow (long names and headers wrap at
+spaces); when that is not enough, each row is shown as label and value lines.
 
 ## Settings
 

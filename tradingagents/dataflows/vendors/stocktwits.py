@@ -22,7 +22,7 @@ import logging
 from datetime import datetime
 from urllib.request import Request, urlopen
 
-from tradingagents.dataflows.date_window import coverage_gap, in_window
+from tradingagents.dataflows.date_window import coverage_gap, in_window, window_zone
 from tradingagents.dataflows.symbols import crypto_base
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,8 @@ def _created_at(message) -> datetime | None:
     return None
 
 
-def _within_window(messages, start_date, end_date):
-    """Keep only messages published in [start_date, end_date] (look-ahead safe).
+def _within_window(messages, start_date, end_date, zone=None):
+    """Keep only messages published in [start_date, end_date], ``zone``'s days (look-ahead safe).
 
     No window (both None) leaves the list untouched for live callers. A message
     whose ``created_at`` (ISO 8601) is unparseable is dropped in a historical
@@ -52,7 +52,7 @@ def _within_window(messages, start_date, end_date):
         return messages
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    return [m for m in messages if in_window(_created_at(m), start_dt, end_dt)]
+    return [m for m in messages if in_window(_created_at(m), start_dt, end_dt, zone)]
 
 
 def _body(message) -> str:
@@ -109,7 +109,7 @@ def fetch_stocktwits_messages(
         return f"<stocktwits unavailable: {type(exc).__name__}>"
 
     fetched = data.get("messages", []) if isinstance(data, dict) else []
-    messages = _within_window(fetched, start_date, end_date)
+    messages = _within_window(fetched, start_date, end_date, window_zone(ticker))
     if not messages:
         if start_date and end_date:
             gap = coverage_gap(

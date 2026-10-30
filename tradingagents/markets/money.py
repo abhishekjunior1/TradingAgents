@@ -1,8 +1,9 @@
 """Money as people in each market read it: INR with Indian digit grouping, lakh and crore.
 
-``format_money`` is the one entry point: INR amounts are grouped the Indian way
-(``₹1,23,45,678.00``) and can be shortened to lakh / crore; any other currency
-keeps the international grouping with its code.
+``format_money`` is the one entry point for amounts: INR amounts are grouped the
+Indian way (``₹1,23,45,678.00``) and can be shortened to lakh / crore; any other
+currency keeps the international grouping with its code. ``format_price`` writes a
+price per unit the same way, with the digits a sub-cent price needs.
 """
 
 import math
@@ -62,6 +63,33 @@ def format_money(value: float | None, currency: str | None, compact: bool = Fals
     if (currency or "").upper() == "INR":
         return format_inr_compact(value) if compact else format_inr(value)
     return f"{value:,.2f}{' ' + currency if currency else ''}"
+
+
+def format_price(value: float | None, currency: str | None) -> str:
+    """A price per unit in its currency, to six significant digits and at least two decimals.
+
+    Two fixed decimals print XRP-BTC's 0.000016 BTC as ``0.00 BTC`` and ETH-BTC's
+    0.028907 as ``0.03``; these are the digits the market tools show
+    (``yahoo.common.price_text``). Totals, values and P/L stay with ``format_money``.
+    """
+    if _missing(value):
+        return "n/a"
+    magnitude = abs(value)
+    decimals = 2 if magnitude == 0 else max(2, 5 - math.floor(math.log10(magnitude)))
+    whole, _, fraction = f"{magnitude:.{decimals}f}".partition(".")
+    digits = fraction.rstrip("0").ljust(2, "0")
+    sign = "-" if value < 0 else ""
+    if (currency or "").upper() == "INR":
+        return f"{sign}₹{indian_grouping(int(whole))}.{digits}"
+    return f"{sign}{int(whole):,}.{digits}{' ' + currency if currency else ''}"
+
+
+def format_quantity(quantity: float) -> str:
+    """A holding's size in full: ``12,345`` shares, ``0.0125`` of a coin (``,.4g`` wrote 1.234e+04)."""
+    if float(quantity).is_integer():
+        return f"{int(quantity):,}"
+    text = f"{quantity:,.8f}".rstrip("0").rstrip(".")
+    return text if text not in ("0", "-0") else f"{quantity:.3g}"     # dust below a satoshi
 
 
 def format_percent(fraction: float | None, signed: bool = True, decimals: int = 2) -> str:

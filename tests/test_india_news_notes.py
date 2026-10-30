@@ -288,7 +288,9 @@ def test_insider_rows_without_a_price_get_no_note_and_load_no_closes():
 
 
 @pytest.mark.unit
-def test_insider_note_is_dropped_quietly_when_closes_cannot_be_loaded():
+def test_insider_rows_keep_the_currency_caveat_when_closes_cannot_be_loaded():
+    """Without closes the prices cannot be checked, which the note says instead of
+    dropping the caveat (a BSE listing with no daily history lost it this way)."""
     frame = _insider(["Sale at price 15.69 per share."])
 
     def broken(*a, **k):
@@ -296,7 +298,9 @@ def test_insider_note_is_dropped_quietly_when_closes_cannot_be_loaded():
 
     out, loaded = _insider_report("RELIANCE.NS", frame, broken)
     assert loaded.called
-    assert out == "# Insider Transactions data for RELIANCE.NS\n" + frame.to_csv()
+    assert out.startswith("# Insider Transactions data for RELIANCE.NS\n" + frame.to_csv() + "\nNote: ")
+    assert "Yahoo does not state the currency" in out and "not assume they are rupee amounts" in out
+    assert "do not match" not in out
 
 
 @pytest.mark.unit
@@ -310,7 +314,10 @@ def test_a_us_listing_gets_no_insider_check():
 def test_closes_are_read_no_later_than_the_run_date():
     frame = _insider(["Sale at price 15.69 per share."])
     _, loaded = _insider_report("RELIANCE.NS", frame, lambda *a, **k: _closes())
-    assert loaded.call_args.args[:2] == ("RELIANCE.NS", get_current_date())
+    symbol, as_of = loaded.call_args.args[:2]
+    # As of the last trade, not the run date itself: a history that stops between the
+    # two is not refused as stale (tests/test_review2_fundamentals.py).
+    assert symbol == "RELIANCE.NS" and as_of <= get_current_date()
 
 
 # --- quarterly cash flow -------------------------------------------------------------

@@ -7,9 +7,10 @@ from datetime import date, datetime
 from typing import Any
 
 from tradingagents.dataflows.date_window import is_historical
+from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.fundamentals import get_company_profile
 from tradingagents.markets.exchanges import day_status, exchange_for_symbol, session_status
-from tradingagents.markets.india import EVIDENCE_RULES, market_briefing
+from tradingagents.markets.india import EVIDENCE_RULES, index_for, market_briefing
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,22 @@ def _market_context(ticker: str, trade_date: str | None, now: datetime | None) -
         day, when = status.local_time.date(), status.describe()
     return (
         f" Market: {exchange.name} ({exchange.code}), benchmark {exchange.benchmark_name} "
-        f"(`{exchange.benchmark}`). {when} {market_briefing(exchange.code, exchange.currency, day)}"
+        f"(`{exchange.benchmark}`){_own_benchmark()}. {when} {market_briefing(exchange.code, exchange.currency, day)}"
     )
+
+
+def _own_benchmark() -> str:
+    """The benchmark a swing run set for its own decision (--benchmark), for the market line; else empty.
+
+    The exchange's headline index stays named: the market tools measure against it.
+    """
+    from tradingagents.dataflows.config import get_config
+    config = get_config()
+    if not config.get("benchmark_ticker") or str(config.get("decision_horizon") or "").lower() == "intraday":
+        return ""
+    symbol = normalize_symbol(config["benchmark_ticker"])
+    index = index_for(symbol)
+    return f"; this run's decision is measured against {index.name if index else symbol} (`{symbol}`)"
 
 
 def build_instrument_context(

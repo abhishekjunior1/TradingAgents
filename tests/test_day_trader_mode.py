@@ -584,9 +584,10 @@ def test_an_intraday_entry_keeps_the_tag_grammar_and_its_plan_parses_back(tmp_pa
     assert intraday["pending"] and intraday["horizon"] == "intraday" and intraday["intraday_plan"] == PLAN
     assert intraday["decision"] == DECISION and intraday["intraday_outcome"] is None
     assert "horizon" not in swing and swing["decision"] == DECISION
-    # one entry per ticker and date, whatever the horizon
-    log.store_decision("RELIANCE.NS", "2026-10-23", "**Rating**: Sell")
-    assert len(log.load_entries()) == 2
+    # one entry per ticker, date and horizon: a swing rating joins the intraday plan, a second plan does not
+    assert log.store_decision("RELIANCE.NS", "2026-10-23", "**Rating**: Sell") is True
+    assert log.store_decision("RELIANCE.NS", "2026-10-23", DECISION, rating="Buy", intraday_plan=PLAN) is False
+    assert len(log.load_entries()) == 3
 
 
 @pytest.mark.unit

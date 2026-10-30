@@ -594,16 +594,16 @@ def test_truncation_flattening_and_quoting():
 @pytest.mark.parametrize(("text", "expected"), [
     ("2026-10-27T16:12:30.000Z", datetime(2026, 10, 27, 16, 12, 30, tzinfo=UTC)),
     ("2026-10-27T21:10:57+05:30", datetime(2026, 10, 27, 15, 40, 57, tzinfo=UTC)),
-    ("2026-01-02", datetime(2026, 1, 2, tzinfo=UTC)),
+    ("2026-01-02", date(2026, 1, 2)),                       # no time: a date, not midnight UTC
     ("Fri, 02 Jan 2026 10:00:00 GMT", datetime(2026, 1, 2, 10, tzinfo=UTC)),
-    ("January 2, 2026", datetime(2026, 1, 2, tzinfo=UTC)),
-    ("13/02/2026", datetime(2026, 2, 13, tzinfo=UTC)),      # only one reading
+    ("January 2, 2026", date(2026, 1, 2)),
+    ("13/02/2026", date(2026, 2, 13)),      # only one reading
     ("2026", None), ("March 2026", None), ("2026-03", None),  # no day: would read as the 1st
     ("March 5", None), ("10:30", None),                         # no year / no date at all
     ("today", None), ("now", None), ("2 days ago", None),     # relative words
     ("05/03/2026", None), ("5.3.26", None),                    # day and month either way round
     ("Sun 03/05/2026", None), ("10:30 03.05.2026", None), ("03 05 2026", None),   # wherever it stands
-    ("2026-01-02 10:00:00", datetime(2026, 1, 2, 10, tzinfo=UTC)),
+    ("2026-01-02 10:00:00", datetime(2026, 1, 2, 10)),     # no zone: the page's wall time, not UTC
     ("2026-02-30", None), ("garbage", None), ("", None), (None, None), (1730000000, None),
     ("2026-01-02" + " " * 120, None),
     ("0001-01-01T00:00:00+05:30", None), ("9999-12-31T23:59:59-05:00", None),   # an unset date: year 0 or 10000
@@ -627,7 +627,7 @@ def test_reading_a_date_leaves_the_process_warning_filters_alone(monkeypatch):
     with warnings.catch_warnings(record=True) as caught:
         warnings.filterwarnings("always", append=True)     # so a warning a parse raises is recorded
         before = list(warnings.filters)
-        assert client.published_date("13/02/2026") == datetime(2026, 2, 13, tzinfo=UTC)   # read day-first
+        assert client.published_date("13/02/2026") == date(2026, 2, 13)   # read day-first
         assert client.published_date("May 9 2025 22:00 EST") is None                       # a zone pandas cannot place
         assert seen and all(filters == before for filters in seen) and warnings.filters == before
     assert caught == []
@@ -687,7 +687,7 @@ def test_news_falls_back_to_the_ticker_when_the_name_lookup_fails(fake, monkeypa
 def test_news_in_a_past_run_keeps_only_items_dated_in_the_window(fake):
     _search_returns(fake, [
         item("Inside", "https://www.a.test/inside", "2025-05-05T10:00:00.000Z", "inside body"),
-        item("Midnight after", "https://a.test/after", "2025-05-10T00:00:00.000Z"),
+        item("Midnight after", "https://a.test/after", "2025-05-10T04:00:00.000Z"),   # New York's midnight
         item("Long after", "https://a.test/later", noon(-1)),
         item("Before", "https://a.test/before", "2025-04-20T12:00:00Z"),
         item("Undated", "https://a.test/undated", None),
@@ -704,8 +704,9 @@ def test_news_in_a_past_run_keeps_only_items_dated_in_the_window(fake):
 
 @pytest.mark.unit
 def test_a_past_run_drops_a_story_whose_page_dates_it_after_the_window_in_its_own_way(fake):
-    # 22:00 at UTC-4 on 9 May is 02:00 UTC on 10 May; 3 May 2026 from a day-first site is not 5 March.
-    _search_returns(fake, [item("After the window", "https://a.test/gmt", "May 9, 2025 10:00 PM GMT-4"),
+    # 01:00 at UTC-4 on 10 May is after New York's 9 May (read the POSIX way, as UTC+4,
+    # it would be 17:00 there on the 9th); 3 May 2026 from a day-first site is not 5 March.
+    _search_returns(fake, [item("After the window", "https://a.test/gmt", "May 10, 2025 1:00 AM GMT-4"),
                            item("Inside", "https://a.test/inside", "May 9, 2025 10:00 AM GMT-4")])
     out = news.get_news_agent_reach("AAPL", PAST_START, PAST_END)
     assert "After the window" not in out and "### Inside (source: a.test, published 2025-05-09)" in out
@@ -932,7 +933,7 @@ def test_read_web_page_reads_through_jina_and_quotes_the_text(fake):
     lines = out.splitlines()
     assert lines[:4] == ["## Web page: Reliance sets record date",
                          "Source: Agent-Reach web read (Jina Reader), https://upstox.com/news/a",
-                         "Published: 2026-10-27 (as the page states)", client.UNTRUSTED_NOTE]
+                         "Published: 2026-10-27 15:40 UTC", client.UNTRUSTED_NOTE]   # no run listing: UTC
     cleaned = client.clean_text(text)
     assert f"Text (first 60 of {len(cleaned)} characters):" in lines
     body = lines[lines.index(f"Text (first 60 of {len(cleaned)} characters):") + 1:]

@@ -8,7 +8,7 @@ import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
 from tradingagents.dataflows.config import get_config
-from tradingagents.dataflows.date_window import coverage_gap, in_window
+from tradingagents.dataflows.date_window import coverage_gap, in_window, window_zone
 from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import yf_retry
@@ -123,8 +123,9 @@ def get_news_yfinance(
 
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    # Keep only articles within the requested window (look-ahead safe).
-    in_range = [a for a in articles if in_window(a["pub_date"], start_dt, end_dt)]
+    # Keep only articles within the requested window, in the listing's days (look-ahead safe).
+    zone = window_zone(canonical)
+    in_range = [a for a in articles if in_window(a["pub_date"], start_dt, end_dt, zone)]
     if in_range:
         return f"## {ticker}{resolved} News, from {start_date} to {end_date}:\n\n{_format_articles(in_range)}"
 
@@ -166,12 +167,13 @@ def _relevant(data: dict, group: dict) -> bool:
     return any(r.upper() in tickers or r.upper().endswith(suffixes) for r in data["related"])
 
 
-def _search_window(queries, fuzzy, limit, start_dt, end_dt, keep=None, seen=None) -> tuple[list[dict], int]:
+def _search_window(queries, fuzzy, limit, start_dt, end_dt, keep=None, seen=None,
+                   zone=None) -> tuple[list[dict], int]:
     """Up to ``limit`` in-window articles from Yahoo searches for ``queries``, and
     how many more in-window articles were skipped as titles already kept.
 
     Titles in ``seen`` are skipped and the ones kept are added to it, so several
-    groups searched in turn share no article.
+    groups searched in turn share no article. The window's days are ``zone``'s.
     """
     seen = set() if seen is None else seen
     articles, repeats = [], 0
@@ -188,7 +190,7 @@ def _search_window(queries, fuzzy, limit, start_dt, end_dt, keep=None, seen=None
             # remaining searches short (#1356). Flat articles are filtered
             # on the same rule, so none can leak future news (#1007).
             data = _extract_article_data(article)
-            if not in_window(data["pub_date"], start_dt, end_dt):
+            if not in_window(data["pub_date"], start_dt, end_dt, zone):
                 continue
             if keep is not None and not keep(data):
                 continue
@@ -214,19 +216,21 @@ def _split(counts: list[int], limit: int) -> list[int]:
     return taken
 
 
-def _format_groups(groups: list[dict], found: list[tuple[list[dict], int]], limit: int) -> str:
+def _format_groups(groups: list[dict], found: list[tuple[list[dict], int]], limit: int,
+                   start_date: str, end_date: str) -> str:
     """The groups' articles under one section each; empty when no group kept any.
 
     ``found`` holds each group's articles and its count of in-window repeats of
     titles already kept. A group showing nothing says why: the limit left it no
-    room, an earlier group's searches already found its stories, or its search kept none.
+    room, an earlier group's searches already found its stories, or its search kept
+    none, which over a window Yahoo's search does not reach is no absence of news.
     """
     taken = _split([len(articles) for articles, _ in found], limit)
     if not any(taken):
         return ""
     out = ""
     for group, (articles, repeats), n in zip(groups, found, taken, strict=True):
-        queries = ", ".join(f'"{q}"' for q in group["queries"])
+        queries = ", ".join(f'"{q}"' for q in group["queries"]) or "none configured"
         out += f"### {group['label']}\n{group.get('about') or 'Stories'} (Yahoo news searches: {queries}).\n\n"
         if n:
             out += _format_articles(articles[:n], heading="####")
@@ -238,7 +242,10 @@ def _format_groups(groups: list[dict], found: list[tuple[list[dict], int]], limi
             empty = (f"Yahoo's news search returned no {group['label']} stories in this window "
                      f"other than ones the searches above had already found.")
         else:
-            empty = group.get("empty") or f"Yahoo's news search returned no {group['label']} stories in this window."
+            # As for the single list, the merged searches prove no coverage of the window.
+            empty = (group.get("empty")
+                     or coverage_gap((), start_date, end_date, "Yahoo Finance global news", f"{group['label']} news")
+                     or f"Yahoo's news search returned no {group['label']} stories in this window.")
         out += f"{empty}\n\n"
     return out
 
@@ -276,6 +283,7 @@ def get_global_news_yfinance(
     curr_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
     start_dt = curr_dt - relativedelta(days=look_back_days)
     start_date = start_dt.strftime("%Y-%m-%d")
+    zone = window_zone()   # the run's listing's days
 
     if groups:
         # Each group is searched to the whole limit, so a share another group
@@ -283,12 +291,12 @@ def get_global_news_yfinance(
         seen = set()
         found = [
             _search_window(g["queries"], g.get("fuzzy", True), limit, start_dt, curr_dt,
-                           lambda d, g=g: _relevant(d, g), seen)
+                           lambda d, g=g: _relevant(d, g), seen, zone)
             for g in groups
         ]
-        news_str = _format_groups(groups, found, limit)
+        news_str = _format_groups(groups, found, limit, start_date, as_of_date)
     else:
-        found, _ = _search_window(config["global_news_queries"], True, limit, start_dt, curr_dt)
+        found, _ = _search_window(config["global_news_queries"], True, limit, start_dt, curr_dt, zone=zone)
         news_str = _format_articles(found[:limit])
 
     # Nothing fell inside the window -> say so rather than return an

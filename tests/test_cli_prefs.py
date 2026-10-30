@@ -125,6 +125,20 @@ def test_selections_are_remembered_after_a_run(monkeypatch):
 
 
 @pytest.mark.unit
+def test_a_run_without_a_terminal_leaves_the_remembered_choices_alone(monkeypatch):
+    """A scheduled job or the /day-trader skill asks nothing; it replaced the choices a
+    person made at the prompts, and the next interactive run offered its settings back."""
+    save_last_run({"llm_provider": "anthropic", "quick_think_llm": "claude-sonnet-5"})
+    monkeypatch.setattr(cli_selections, "_prompt_selections",
+                        lambda prefs, flags: {"llm_provider": "claude_code", "quick_think_llm": "sonnet"})
+    monkeypatch.setattr(cli_selections.sys.stdin, "isatty", lambda: False)
+
+    cli_selections.get_user_selections()
+
+    assert load_last_run() == {"llm_provider": "anthropic", "quick_think_llm": "claude-sonnet-5"}
+
+
+@pytest.mark.unit
 def test_a_custom_language_is_remembered_without_breaking_the_next_run():
     """A free-text answer is not one of the menu's choices, and questionary
     rejects a default it cannot find, so offering it back would crash startup."""

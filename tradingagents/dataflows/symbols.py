@@ -15,7 +15,8 @@ differ from the broker / TradingView / MT5 style symbols users often type:
     600519.SH         600519.SS         Yahoo spells Shanghai ``.SS``
     NSE:RELIANCE,     RELIANCE.NS       NSE listings take ``.NS``; brokers,
       RELIANCE.NSE,                     TradingView and data vendors spell
-      RELIANCE-EQ                       the exchange other ways
+      RELIANCE-EQ,                      the exchange other ways
+      NSE:RELIANCE-EQ
     BSE:RELIANCE      RELIANCE.BO       BSE listings take ``.BO`` (by symbol;
                                         Yahoo serves no BSE scrip codes)
     NIFTY, BANKNIFTY  ^NSEI, ^NSEBANK   Indian index names map to Yahoo's
@@ -93,19 +94,26 @@ _SHANGHAI_SH = re.compile(r"^(\d{6})\.SH$")
 _EXCHANGE_PREFIX = re.compile(r"^(NSE|BSE|BOM)\s*:\s*(\S.*)$")
 _VENDOR_SUFFIX = {".NSE": ".NS", ".BSE": ".BO"}
 _NSE_EQ_SERIES = re.compile(r"^([A-Z0-9&\-]+)-EQ$")
+# What may follow the symbol after an exchange prefix, which already names the exchange: NSE's
+# series (Fyers writes NSE:SBIN-EQ) or a listing suffix, Yahoo's or a data vendor's.
+_SERIES_OR_SUFFIX = re.compile(r"(-EQ|\.NSE?|\.BO|\.BSE)$")
 # A symbol that names no market: no suffix, index caret, future or pair marker.
 _BARE = re.compile(r"^[A-Z0-9][A-Z0-9&\-]*$")
 _BSE_SCRIP_CODE = re.compile(r"^\d{6}(\.BO)?$")
 
 
 def _indian_listing(s: str) -> str:
-    """``NSE:RELIANCE``, ``RELIANCE.NSE``, ``RELIANCE-EQ`` -> ``RELIANCE.NS``; ``BSE:``/``BOM:`` -> ``.BO``."""
+    """``NSE:RELIANCE``, ``RELIANCE.NSE``, ``RELIANCE-EQ`` -> ``RELIANCE.NS``; ``BSE:``/``BOM:`` -> ``.BO``.
+
+    The prefix names the exchange, so a series or listing suffix after the symbol is dropped:
+    ``NSE:RELIANCE-EQ`` and ``NSE:RELIANCE.NS`` are ``RELIANCE.NS``.
+    """
     if prefixed := _EXCHANGE_PREFIX.match(s):
         venue, symbol = prefixed.groups()
         index = index_for(symbol)
         if index is not None:
             return index.symbol
-        return symbol.strip() + (".NS" if venue == "NSE" else ".BO")
+        return _SERIES_OR_SUFFIX.sub("", symbol.strip()) + (".NS" if venue == "NSE" else ".BO")
     for vendor, yahoo in _VENDOR_SUFFIX.items():
         if s.endswith(vendor):
             return s[: -len(vendor)] + yahoo
@@ -142,11 +150,30 @@ def _normalize_crypto(s: str) -> str | None:
     return f"{base}-USD" if base else None
 
 
+# Yahoo's crypto pairs, ``<BASE>-<QUOTE>``, quoted in a currency (BTC-INR, BTC-EUR) or in a coin
+# (ETH-BTC in BTC, SOL-ETH in ETH). What follows the dash of a US share class or series (BRK-B,
+# BAC-PL) is neither.
+_CRYPTO_PAIR = re.compile(r"^[A-Z0-9]+-([A-Z]{3,4})$")
+_COIN_QUOTES = _CRYPTO_BASES | {"USDT", "USDC"}
+
+
+def crypto_quote_currency(symbol: str) -> str | None:
+    """The currency or coin a canonical Yahoo crypto pair is priced in, the one it names
+    (``BTC-USD`` in USD, ``BTC-INR`` in INR, ``ETH-BTC`` in BTC); None for any other symbol."""
+    pair = _CRYPTO_PAIR.fullmatch(symbol) if isinstance(symbol, str) else None
+    quote = pair.group(1) if pair else None
+    return quote if quote in _FOREX_CURRENCIES or quote in _COIN_QUOTES else None
+
+
+def _is_crypto_pair(symbol: str) -> bool:
+    return crypto_base(symbol) is not None or crypto_quote_currency(symbol) is not None
+
+
 def is_us_listing(symbol: str) -> bool:
     """Whether a canonical Yahoo symbol is a plain US listing: one that names no
     market (no suffix, index caret, future or pair marker) and is not a crypto
-    pair. Yahoo lists such symbols on US exchanges."""
-    return isinstance(symbol, str) and bool(_BARE.fullmatch(symbol)) and crypto_base(symbol) is None
+    pair (``BTC-USD``, ``BTC-INR``, ``ETH-BTC``). Yahoo lists such symbols on US exchanges."""
+    return isinstance(symbol, str) and bool(_BARE.fullmatch(symbol)) and not _is_crypto_pair(symbol)
 
 
 def listing_zone(symbol: str | None) -> ZoneInfo | None:
@@ -235,7 +262,7 @@ def resolve_symbol(raw: str, default_exchange: str | None = None) -> str:
             f"{raw!r} looks like a BSE scrip code; Yahoo Finance has no data for those. "
             "Use the trading symbol with its exchange, e.g. RELIANCE.BO or RELIANCE.NS."
         )
-    if exchange is None or not _BARE.fullmatch(canonical) or crypto_base(canonical):
+    if exchange is None or not _BARE.fullmatch(canonical) or _is_crypto_pair(canonical):
         return canonical
     return canonical + exchange.suffix
 

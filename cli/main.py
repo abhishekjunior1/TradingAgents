@@ -1,3 +1,4 @@
+import os
 import sys
 from enum import StrEnum
 from typing import Annotated
@@ -11,18 +12,23 @@ from cli.models import AssetType
 from cli.prompts import (
     DEFAULT_ANALYSTS,
     filter_analysts_for_asset_type,
+    parse_analysis_date,
     parse_analysts,
     parse_horizon,
     parse_vendors,
 )
 from cli.run import run_analysis
+from cli.selections import run_horizon
 from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import resolve_symbol
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.claude_code_client import ClaudeCodeError
+from tradingagents.llm_clients.factory import tier_provider
 from tradingagents.llm_clients.openai_client import SIGNED_IN_PROVIDERS
 from tradingagents.markets.exchanges import get_exchange
 from tradingagents.markets.watchlists import watchlist_symbols
+from tradingagents.memory.settlement import check_benchmark
 from tradingagents.portfolio import load_portfolio
 
 # prompt_toolkit's win32 output module is importable only on Windows (it asserts
@@ -86,8 +92,9 @@ def analyze(
     ),
     benchmark: str = typer.Option(
         None, "--benchmark",
-        help="Index the decision is measured against, e.g. NIFTY 50, BANKNIFTY or ^NSEI "
-        "(default: the exchange's headline index)",
+        help="Index or symbol this run's swing decision is measured against, e.g. NIFTY IT, BANKNIFTY or "
+        "QQQ; checked before the run (default: NIFTY 50 or SENSEX for an NSE/BSE listing, else the "
+        "benchmark_map index for its suffix, SPY for a US listing)",
     ),
     vendor: Annotated[list[str] | None, typer.Option(
         "--vendor",
@@ -124,6 +131,26 @@ def analyze(
     except ValueError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from None
+    # The graph refuses such a benchmark too, but only after the setup questions have been
+    # answered. An intraday plan has no benchmark, so its run checks none.
+    chosen = benchmark or DEFAULT_CONFIG.get("benchmark_ticker")
+    closes = {}     # what the check fetches, for the graph's own checks to be answered from
+    if run_horizon({"horizon": horizon}) == "intraday":
+        if benchmark:
+            console.print("--benchmark applies to swing decisions; this intraday run does not use it.")
+    elif chosen:
+        try:
+            run_date = parse_analysis_date(date) if date else None
+        except ValueError:
+            run_date = None     # the date step refuses it, with its reason
+        try:
+            # At --date's day: a past-dated run needs prices there. The closes are fetched through
+            # today, so they answer the graph's check of the last 30 days as well.
+            check_benchmark(chosen, DEFAULT_CONFIG, as_of=run_date, seen=closes)
+        except (ValueError, VendorUnavailableError) as exc:
+            source = "--benchmark" if benchmark else "TRADINGAGENTS_BENCHMARK_TICKER"
+            console.print(f"[red]{escape(f'{source} {chosen}: {exc}')}[/red]")
+            raise typer.Exit(code=1) from None
     if clear_checkpoints:
         from tradingagents.graph.checkpointer import clear_all_checkpoints
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
@@ -133,14 +160,16 @@ def analyze(
         try:
             portfolio_context = load_portfolio(portfolio, listing.code if listing else None)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{escape(str(exc))}[/red]")
             raise typer.Exit(code=1) from None
 
     try:
         flags = {"ticker": ticker, "date": date, "analysts": analysts, "save": save, "show": show, "html": html,
                  "exchange": listing.code if listing else None, "benchmark": benchmark, "vendors": vendors,
                  "horizon": horizon, "arena": arena, "arena_yes": arena_yes}
-        run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags)
+        # The benchmark's closes, when the check fetched any, so the graph does not fetch them again.
+        kept = {"benchmark_closes": closes} if closes else {}
+        run_analysis(checkpoint=checkpoint, portfolio=portfolio_context, flags=flags, **kept)
     except _NO_CONSOLE_ERRORS:
         # A terminal with no console buffer cannot host the interactive prompts.
         # Emit one actionable line on stderr instead of a prompt_toolkit
@@ -196,7 +225,8 @@ def backtest(
         chosen = (parse_analysts(analysts, kind) if analysts
                   else filter_analysts_for_asset_type(list(DEFAULT_ANALYSTS), kind))
         if watchlist:
-            names = watchlist_symbols(watchlist, DEFAULT_CONFIG, lambda s: resolve_symbol(s, code))
+            # Names only: a typo read as a ticker would be swept, a model run per date.
+            names = watchlist_symbols(watchlist, DEFAULT_CONFIG, lambda s: resolve_symbol(s, code), names_only=True)
         else:
             names = [resolve_symbol(t.strip(), code) for t in (tickers or "").split(",") if t.strip()]
     except ValueError as exc:
@@ -207,8 +237,21 @@ def backtest(
         console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL, or --watchlist[/red]")
         raise typer.Exit(code=1)
 
+    # A sweep asks nothing, and the built-in models are OpenAI's: a tier on another provider
+    # without its own model would fail in every cell, after the cell's other calls were paid for.
+    providers = {tier: tier_provider(DEFAULT_CONFIG, tier) for tier in ("quick", "deep")}
+    missing = [tier for tier, provider in providers.items()
+               if provider.strip() != "openai"
+               and not os.environ.get(f"TRADINGAGENTS_{tier.upper()}_THINK_LLM")]
+    for tier in missing:
+        console.print(f"[red]The {tier} tier runs on {escape(providers[tier])}, so a backtest needs "
+                      f"TRADINGAGENTS_{tier.upper()}_THINK_LLM set to one of its models.[/red]")
+    if missing:
+        raise typer.Exit(code=1)
+
     def show_progress(done, total, ticker, date):
-        console.print(f"[dim][{done}/{total}] {ticker} {date}[/dim]")
+        # The ticker is the user's: as markup, "[/X]" would end the sweep before its settlement pass.
+        console.print(f"[{done}/{total}] {ticker} {date}", style="dim", markup=False)
 
     kwargs = {"asset_type": kind.value, "portfolio": book, "run_id": run_id, "progress": show_progress,
               "selected_analysts": [a.value for a in chosen]}
@@ -216,15 +259,16 @@ def backtest(
     try:
         result = run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)
     except Exception as exc:  # a missing key or an unknown analyst is a setup error
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from None
     console.print(summarize(result).render())
-    console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
+    console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {escape(str(result.log_path))}")
     console.print(f"Continue or settle this sweep: --run-id {result.run_id}")
+    # Reasons are exception text, often with brackets ("[type=missing, ...]"): printed as text.
     for ticker, date, reason in result.failures:
-        console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
+        console.print(f"[yellow]failed:[/yellow] {escape(ticker)} {escape(date)}: {escape(reason)}")
     for ticker, reason in result.settlement_failures:
-        console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+        console.print(f"[yellow]unsettled:[/yellow] {escape(ticker)}: {escape(reason)}")
 
 
 @app.command()
@@ -240,6 +284,8 @@ def market(
 
     try:
         listing = get_exchange(exchange)
+        if listing is None:   # a blank value, such as an unset variable in a script
+            raise ValueError(f"--exchange takes nse or bse, got {exchange!r}")
         show_market(listing, watchlist, date)
     except ValueError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")

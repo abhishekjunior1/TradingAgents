@@ -27,6 +27,20 @@ def _blank_settings_overlay():
 _blank_settings_overlay()
 
 
+def _no_real_screening_key():
+    """Keep the developer's own TypeSafe key out of the suite.
+
+    Screening runs whenever TYPESAFE_API_KEY is set, and a worker thread can outlive
+    the test that started it; blank (load_dotenv then leaves them alone), the key and
+    base URL cannot reach it. Tests of screening set their own.
+    """
+    for name in ("TYPESAFE_API_KEY", "TYPESAFE_BASE_URL"):
+        os.environ[name] = ""
+
+
+_no_real_screening_key()
+
+
 def _own_file_locations():
     """Keep the suite's results, cache and memory log in a directory of its own.
 

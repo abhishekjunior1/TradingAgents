@@ -15,6 +15,8 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
+from tradingagents.markets.exchanges import EXCHANGES, Exchange
+
 
 @dataclass(frozen=True)
 class IndexInfo:
@@ -152,6 +154,20 @@ def session_rules(day: date) -> str:
             "stocks with derivatives; post-close session 15:50-16:00")
 
 
+def special_session_hours(exchange: Exchange, day: date) -> str | None:
+    """``day``'s special session when it keeps other hours than the regular ones (Muhurat trading), else None."""
+    special = exchange.special_sessions.get(day)
+    if not special or special[2:] == exchange.regular:
+        return None
+    return (f"{special[0]}, a special session: pre-open {special[1]:%H:%M}-{special[2]:%H:%M} "
+            f"{exchange.tz_label}, trading {special[2]:%H:%M}-{special[3]:%H:%M}")
+
+
+def hours_in_force(exchange: Exchange, day: date) -> str:
+    """The hours in force on ``day``: a special session's on other hours, else ``session_rules``."""
+    return special_session_hours(exchange, day) or session_rules(day)
+
+
 # RBI Monetary Policy Committee meetings for 2026-27 (RBI press release
 # 2025-2026/2306 of 23 Mar 2026). Before that release they were not public.
 MPC_SCHEDULE_PUBLISHED = date(2026, 3, 23)
@@ -180,12 +196,17 @@ def market_briefing(exchange_code: str, currency: str = "INR", on: date | None =
     meeting = next_mpc_meeting(on)
     mpc = (f"; the next scheduled meeting is {meeting[0]:%d}-{meeting[1]:%d %b %Y} (decisions are customarily "
            "announced on its last day)") if meeting else ""
+    # A special session on other hours (Muhurat trading) keeps its own that day; the usual
+    # hours stay given, for the sessions either side of it.
+    exchange = EXCHANGES.get(exchange_code)
+    special = special_session_hours(exchange, on) if exchange is not None else None
+    in_force = f" Hours in force on {on:%d %b %Y}: {special}." if special else ""
     return (
         f"Indian market rules for this {exchange_code} listing: prices, values and returns are in {currency}; "
         f"the exchange runs on India Standard Time (IST, UTC+05:30) and trades on weekdays that are not "
-        f"exchange holidays, plus occasional special sessions such as Muhurat trading at Diwali: "
-        f"{session_rules(on)}. A day's close is final only after the post-close session. The same company may "
-        f"also trade on {other} at a slightly different price. Equity trades settle T+1. "
+        f"exchange holidays, plus occasional special sessions such as Muhurat trading at Diwali. Usual hours: "
+        f"{session_rules(on)}.{in_force} A day's close is final only after the post-close session. "
+        f"The same company may also trade on {other} at a slightly different price. Equity trades settle T+1. "
         "Stocks without derivatives carry fixed daily price bands (circuit limits) set by the exchange, "
         "commonly 2%, 5%, 10% or 20%; stocks with derivatives have no fixed band but a 10% dynamic band the "
         "exchange widens in steps after a cooling-off period; the band for this stock is not in your tools, "

@@ -125,7 +125,8 @@ def test_the_sizing_reference_follows_the_configured_risk_budget():
 @pytest.mark.unit
 def test_a_book_in_two_currencies_sums_nothing_across_them():
     text = _block({"cash": 10_000, "currency": "USD", "positions": [{"ticker": "RELIANCE.NS", "quantity": 10}]})
-    assert "several currencies" in text and "Concentration" not in text and "Sizing reference" not in text
+    assert "several currencies" in text and "Concentration" not in text and "allows about" not in text
+    assert "Sizing reference: n/a (the book holds several currencies" in text
 
 
 @pytest.mark.unit

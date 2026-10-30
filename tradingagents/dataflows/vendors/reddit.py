@@ -29,15 +29,15 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from tradingagents.dataflows.date_window import coverage_gap, in_window
+from tradingagents.dataflows.date_window import coverage_gap, in_window, window_zone
 from tradingagents.dataflows.symbols import crypto_base
 from tradingagents.markets.exchanges import exchange_for_symbol
 
 logger = logging.getLogger(__name__)
 
 
-def _within_window(posts, start_date, end_date):
-    """Keep only posts published in [start_date, end_date] (look-ahead safe).
+def _within_window(posts, start_date, end_date, zone=None):
+    """Keep only posts published in [start_date, end_date], ``zone``'s days (look-ahead safe).
 
     No window (both None) leaves the list untouched for live callers. A post with
     no ``created_utc`` epoch is dropped in a historical window (#1220).
@@ -46,7 +46,7 @@ def _within_window(posts, start_date, end_date):
         return posts
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    return [p for p in posts if in_window(_posted_at(p), start_dt, end_dt)]
+    return [p for p in posts if in_window(_posted_at(p), start_dt, end_dt, zone)]
 
 
 def _posted_at(post) -> datetime | None:
@@ -293,6 +293,7 @@ def fetch_reddit_posts(
     per-subreddit cut, so the posts it keeps fill the slots.
     """
     subreddits = list(subreddits or subreddits_for(ticker))
+    zone = window_zone(ticker)   # before the suffix goes: a bare RELIANCE reads as a US listing
     # Crypto reaches us as a Yahoo pair (BTC-USD) and an Indian stock with its
     # suffix (RELIANCE.NS); search Reddit for the name people write ("BTC",
     # "RELIANCE") so the query actually matches discussion instead of near-nothing.
@@ -303,7 +304,7 @@ def fetch_reddit_posts(
         return f"<Reddit unavailable: fetch failed ({label}); this is not an absence of discussion>"
 
     window = bool(start_date and end_date)
-    posts = _within_window(fetched, start_date, end_date)
+    posts = _within_window(fetched, start_date, end_date, zone)
     if not posts:
         gap = window and coverage_gap(
             _coverage_dates(fetched), start_date, end_date,
@@ -346,7 +347,8 @@ def fetch_reddit_posts(
         for p in sub_posts:
             title = (p.get("title") or "").replace("\n", " ").strip()
             created = p.get("created_utc")
-            created_str = time.strftime("%Y-%m-%d", time.gmtime(created)) if created else "?"
+            # The listing's date, as the window that kept the post counts days.
+            created_str = datetime.fromtimestamp(created, zone or UTC).strftime("%Y-%m-%d") if created else "?"
             selftext = (p.get("selftext") or "").replace("\n", " ").strip()
             if len(selftext) > 240:
                 selftext = selftext[:240] + "…"

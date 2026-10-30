@@ -1,5 +1,7 @@
 """Jev post screening, against TypeSafe's documented request and response shapes."""
 
+import threading
+
 import pytest
 import requests
 
@@ -46,7 +48,13 @@ def post(monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", "ts-test")
     monkeypatch.delenv("TYPESAFE_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
-    return calls
+    before = set(threading.enumerate())
+    yield calls
+    # _ask_each returns without waiting for a request in flight; its worker must finish
+    # against these fakes, before they are undone, not against the real requests.post
+    # and the developer's own TYPESAFE_API_KEY in a later test.
+    for thread in set(threading.enumerate()) - before:
+        thread.join(timeout=5)
 
 
 def _ok():

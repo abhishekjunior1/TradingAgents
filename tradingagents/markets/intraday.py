@@ -84,6 +84,11 @@ def _special(exchange: Exchange | None, day: date) -> str:
     return f" ({special[0]}, {special[2]:%H:%M}-{special[3]:%H:%M} {exchange.tz_label})" if special else ""
 
 
+def _other_hours(exchange: Exchange | None, day: date) -> bool:
+    """Whether ``day``'s session keeps other hours than the exchange's usual (Muhurat trading)."""
+    return exchange is not None and exchange.hours_on(day)[1:] != exchange.regular
+
+
 def target_session(exchange: Exchange | None, as_of: date, now: datetime, *, tz=None,
                    hours: tuple[time, time] | None = None) -> tuple[date, str]:
     """The session a plan made at ``now``, in a run dated ``as_of``, is for, and why.
@@ -247,24 +252,30 @@ def _minute_of_day(stamps: pd.Series) -> pd.Series:
 
 
 def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date, now: datetime, *,
-                    interval: str | None = None, exchange: Exchange | None = None) -> dict:
+                    interval: str | None = None, exchange: Exchange | None = None,
+                    cutoff: datetime | None = None) -> dict:
     """What a day trader reads before planning ``target``, from bars already cut off at the analysis time.
 
     Keys (None where it cannot be computed): ``last_session`` (date, open, high,
     low, close, volume, source) is the latest session before ``target``, from the
-    bars or else the daily rows; ``current`` (open, high, low, last, vwap, volume,
+    bars or else the daily rows, and ``last_session_through`` its last bar's end
+    when the bars' ``cutoff`` (no bar ending later was served) fell before its
+    close, so it is not complete; ``current`` (open, high, low, last, vwap, volume,
     bars, through) is ``target`` so far once it has a bar; ``opening_range`` maps
     15 and 30 minutes to their high and low once the bars cover them; ``pivots``
     are classic floor pivots from ``last_session``; ``gap_pct`` is the first bar's
     open against the previous close, and ``official_gap`` (open, previous_close,
     pct) the daily bar's open, the exchange's opening price, against the previous
-    daily close; ``relative_volume`` compares the volume so far
-    with the prior sessions' average to the same time of day, and
-    ``last_session_relative_volume`` the last session's with the sessions before
-    it (both averages leave out a special session on other hours, such as Muhurat
-    trading); ``atr_intraday`` and ``atr_daily`` are Wilder's ATR(14) on the bars and on
-    the daily rows before ``target``; ``last_vs_vwap_pct``; ``reference_price``
-    is the newest close, at ``data_through``. Percentages are in percent.
+    daily close; ``relative_volume`` compares the volume so far with the prior
+    sessions' average to the same time of day, and ``last_session_relative_volume``
+    the last session's with the sessions before it (to the same time, for one not
+    complete). Both averages leave out a special session on other hours, such as
+    Muhurat trading, which gets no ratio of its own: the usual sessions trade at
+    its times of day too, but on other hours its volume cannot be compared like
+    for like with theirs. ``atr_intraday`` and ``atr_daily`` are Wilder's ATR(14)
+    on the bars and on the daily rows before ``target``; ``last_vs_vwap_pct``;
+    ``reference_price`` is the newest close, at ``data_through``. Percentages are
+    in percent.
     """
     frame = _clean(bars)
     minutes = _minutes(frame, interval) if len(frame) else (INTERVAL_MINUTES[interval] if interval else None)
@@ -280,6 +291,7 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
         "bars": len(frame),
         "data_through": None,
         "last_session": None,
+        "last_session_through": None,
         "current": None,
         "opening_range": dict.fromkeys(OPENING_RANGE_MINUTES),
         "pivots": None,
@@ -308,23 +320,40 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
         return levels
 
     ends = bar_ends(frame, minutes, exchange)
+    end_minutes = _minute_of_day(ends)
     days = frame["Datetime"].dt.date
     session_days = sorted(set(days))
     earlier = [day for day in session_days if day < target]
     # The volume averages leave out a session on other hours than the exchange's usual
     # (Muhurat trading, about an hour in the afternoon): it would read as one that traded
-    # little, or nothing by the morning.
-    usual = [day for day in earlier if exchange is None or exchange.hours_on(day)[1:] == exchange.regular]
+    # little, or nothing by the morning. Nor is such a session given a ratio of its own.
+    usual = [day for day in earlier if not _other_hours(exchange, day)]
     levels.update(sessions=session_days, data_through=ends.max(), reference_price=float(frame["Close"].iloc[-1]),
                   atr_intraday=risk.average_true_range(frame, ATR_PERIODS))
+
+    def volume_to(day: date, minute: int | None) -> float:
+        """``day``'s volume in the bars ending by ``minute`` of the day (all of them for None)."""
+        rows = days == day
+        if minute is not None:
+            rows &= end_minutes <= minute
+        return float(frame.loc[rows, "Volume"].sum())
 
     source = f"{levels['interval']} bars"
     if earlier:
         last_day = earlier[-1]
-        levels["last_session"] = _session_summary(frame[days == last_day], last_day, source)
-        totals = [float(frame.loc[days == day, "Volume"].sum()) for day in usual if day != last_day]
+        last_rows = frame[days == last_day]
+        levels["last_session"] = _session_summary(last_rows, last_day, source)
+        # The cut-off can fall before that session's close (a delayed feed just after it):
+        # it is then not complete, and its volume is set against the others' to the same time.
+        to = None
+        if cutoff is not None and exchange is not None:
+            close = pd.Timestamp(datetime.combine(last_day, exchange.hours_on(last_day)[2]), tz=zone)
+            if _local(cutoff, exchange) < close:
+                levels["last_session_through"] = ends[last_rows.index].max()
+                to = int(end_minutes[last_rows.index].max())
+        totals = [volume_to(day, to) for day in usual if day != last_day]
         average = sum(totals) / len(totals) if totals else 0.0
-        if average > 0:
+        if average > 0 and not _other_hours(exchange, last_day):
             levels["last_session_relative_volume"] = levels["last_session"]["volume"] / average
     elif daily_rows is not None:
         levels["last_session"] = _session_summary(daily_rows.tail(1), daily_rows["Day"].iloc[-1], "daily bar")
@@ -359,11 +388,11 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
             levels["opening_range"][span] = {"high": float(window["High"].max()), "low": float(window["Low"].min()),
                                              "start": opened, "end": window_end}
 
-    # Relative volume: the volume so far against what the prior sessions had
-    # traded by the same time of day.
-    cutoff = int(_minute_of_day(pd.Series([through])).iloc[0])
-    end_minutes = _minute_of_day(ends)
-    so_far = [float(frame.loc[(days == day) & (end_minutes <= cutoff), "Volume"].sum()) for day in usual]
+    # Relative volume: the volume so far against what the prior sessions had traded by
+    # the same time of day; none for a session on other hours, not like for like with them.
+    if _other_hours(exchange, target):
+        return levels
+    so_far = [volume_to(day, int(_minute_of_day(pd.Series([through])).iloc[0])) for day in usual]
     average = sum(so_far) / len(so_far) if so_far else 0.0
     if average > 0:
         levels.update(relative_volume=volume / average, relative_volume_sessions=len(so_far))
@@ -510,12 +539,17 @@ def _bar_table(bars: pd.DataFrame, limit: int) -> list[str]:
 def format_intraday_snapshot(symbol: str, levels: Mapping, target: tuple[date, str], square_off: time | None,
                              sizing_examples: Sequence[Mapping | None], notes: Sequence[str], *,
                              recent_bars: pd.DataFrame | None = None, recent_limit: int = RECENT_BARS,
-                             source: str = "Yahoo Finance", fetched_at: datetime | None = None) -> str:
+                             source: str = "Yahoo Finance", fetched_at: datetime | None = None,
+                             daily_adjusted: bool = False) -> str:
     """The intraday snapshot as markdown: every number with the bars it came from, then the source-of-truth line.
 
     ``fetched_at`` is shown only when given: a run dated in the past is not told
-    when the data was fetched.
+    when the data was fetched. ``daily_adjusted`` says the daily rows are
+    dividend-adjusted (Yahoo's are, for an instrument that pays dividends), so a
+    price taken from them, and the pivots and gaps computed from one, are
+    labelled so: on an ex-dividend day they are not the ones that traded.
     """
+    adjusted = ", dividend-adjusted" if daily_adjusted else ""
     exchange = exchange_for_symbol(symbol)
     currency = exchange.currency if exchange is not None else None
     label = levels.get("tz_label") or ""
@@ -540,15 +574,29 @@ def format_intraday_snapshot(symbol: str, levels: Mapping, target: tuple[date, s
         lines.append("- Exit by: the session close (no square-off time is configured for this listing).")
 
     last = levels.get("last_session")
-    lines += ["", f"## Last complete session: {_day(last['date']) if last else 'n/a'}"
-              + (f" (from the {last['source']})" if last else "")]
+    partial = levels.get("last_session_through") if last else None
+    # Read from the daily rows (the bars hold no earlier session), it carries their adjustment,
+    # and so do the pivots from it and the gap at the first bar's open measured against its close.
+    last_adjusted = adjusted if last and last["source"] == "daily bar" else ""
+    if partial is not None:
+        closes = f" {exchange.hours_on(last['date'])[2]:%H:%M}" if exchange is not None else ""
+        compared = (f"; its volume is set against the sessions before it to {_clock(partial)}"
+                    if levels.get("last_session_relative_volume") is not None else "")
+        lines += ["", f"## Last session: {_day(last['date'])}, through {_clock(partial)} {label} only "
+                      f"(from the {last['source']})", "",
+                  f"The data was cut before its{closes} close, so its bars after {_clock(partial)} are missing and "
+                  f"its high, low, close and volume are not final{compared}."]
+    else:
+        lines += ["", f"## Last complete session: {_day(last['date']) if last else 'n/a'}"
+                  + (f" (from the {last['source']}{last_adjusted})" if last else "")]
     if last:
         relative = levels.get("last_session_relative_volume")
+        ratio = (f"{relative:.2f}x" if relative is not None
+                 else "n/a (a session on other hours)" if _other_hours(exchange, last["date"]) else "n/a")
         lines += ["", "| Open | High | Low | Close | Volume | Volume vs the sessions before it |",
                   "|---:|---:|---:|---:|---:|---:|",
                   f"| {_price(last['open'])} | {_price(last['high'])} | {_price(last['low'])} | "
-                  f"{_price(last['close'])} | {_volume(last.get('volume'))} | "
-                  f"{f'{relative:.2f}x' if relative is not None else 'n/a'} |"]
+                  f"{_price(last['close'])} | {_volume(last.get('volume'))} | {ratio} |"]
     else:
         lines.append("Unavailable: no completed session in the bars or the daily rows.")
 
@@ -562,15 +610,25 @@ def format_intraday_snapshot(symbol: str, levels: Mapping, target: tuple[date, s
                   f"| VWAP | {_price(current['vwap'])} |",
                   f"| Last vs VWAP | {_pct(levels.get('last_vs_vwap_pct'))} |",
                   f"| Volume | {_volume(current['volume'])} |",
-                  f"| Gap at the first bar's open vs the previous close | {_pct(levels.get('gap_pct'))} |"]
+                  f"| Gap at the first bar's open vs the previous close{last_adjusted} | "
+                  f"{_pct(levels.get('gap_pct'))} |"]
         official = levels.get("official_gap")
         if official:
             lines.append(f"| Gap at the opening price (daily bar, {_price(official['open'])}) vs the previous daily "
-                         f"close ({_price(official['previous_close'])}) | {_pct(official['pct'])} |")
+                         f"close{adjusted} ({_price(official['previous_close'])}) | {_pct(official['pct'])} |")
         relative = levels.get("relative_volume")
         if relative is not None:
             lines.append(f"| Relative volume (vs the {levels['relative_volume_sessions']} prior sessions' average "
                          f"to {_clock(current['through'])}) | {relative:.2f}x |")
+        elif _other_hours(exchange, current["date"]):
+            # The usual sessions trade at these times of day too (Muhurat's hours fall inside
+            # theirs); what sets the volumes apart is the hours kept, so the row gives both.
+            # "Usual", not "regular": the session line calls a special session's hours its regular ones.
+            _, opens, closes = exchange.hours_on(current["date"])
+            usual_open, usual_close = exchange.regular
+            lines.append(f"| Relative volume | n/a (a special session on other hours: it trades {opens:%H:%M}-"
+                         f"{closes:%H:%M}, the usual sessions {usual_open:%H:%M}-{usual_close:%H:%M}, so its "
+                         "volume so far cannot be compared like for like with theirs) |")
         else:
             lines.append("| Relative volume | n/a (no prior session with volume in the bars) |")
         for span, found in (levels.get("opening_range") or {}).items():
@@ -581,8 +639,9 @@ def format_intraday_snapshot(symbol: str, levels: Mapping, target: tuple[date, s
                   "Its open, VWAP, gap, opening range and relative volume do not exist until it trades."]
 
     pivots = levels.get("pivots")
-    lines += ["", "## Classic floor pivots" + (f" from the {pivots['from']:%d %b %Y} high, low and close"
-                                                 if pivots else "")]
+    lines += ["", "## Classic floor pivots" + (f" from the {pivots['from']:%d %b %Y} high, low and close{last_adjusted}"
+                                                 if pivots else "")
+              + (f" through {_clock(partial)} (not final)" if pivots and partial is not None else "")]
     if pivots:
         lines += ["", "| R3 | R2 | R1 | P | S1 | S2 | S3 |", "|---:|---:|---:|---:|---:|---:|---:|",
                   "| " + " | ".join(_price(pivots[k]) for k in ("R3", "R2", "R1", "P", "S1", "S2", "S3")) + " |"]

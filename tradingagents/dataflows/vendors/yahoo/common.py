@@ -4,6 +4,7 @@ reported, and how a price is written out."""
 import logging
 import math
 import time
+import warnings
 
 import yfinance as yf
 from yfinance.exceptions import YFPricesMissingError, YFRateLimitError
@@ -12,6 +13,25 @@ from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableE
 from tradingagents.dataflows.net import vendor_reachable
 
 logger = logging.getLogger(__name__)
+
+
+def _quiet_pandas_deprecations_from_yfinance() -> None:
+    """Hide pandas' deprecation notices raised from yfinance's own code.
+
+    yfinance shows every DeprecationWarning raised from its modules (it installs a
+    "default" filter for ``^yfinance``, which outranks PYTHONWARNINGS), and yfinance
+    1.7 still uses pandas features pandas 3.1 deprecates (``inplace=``), so each
+    download printed pandas' notices into a run's output. Installed after yfinance's
+    filter, this one comes first; every other warning is left as it was.
+    """
+    try:
+        from pandas.errors import PandasDeprecationWarning
+    except ImportError:            # pandas before 3.0: neither the class nor these notices
+        return
+    warnings.filterwarnings("ignore", category=PandasDeprecationWarning, module=r"^yfinance")
+
+
+_quiet_pandas_deprecations_from_yfinance()
 
 YAHOO_HOST = "https://query2.finance.yahoo.com"
 

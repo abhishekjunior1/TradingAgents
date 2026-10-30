@@ -99,14 +99,25 @@ def parse_ticker(value: str, exchange: str | None = None) -> str:
     return resolve_symbol(value, exchange)
 
 
+# The key a vendor cannot run without.
+_VENDOR_KEYS = {"alpha_vantage": "ALPHA_VANTAGE_API_KEY"}
+
+
+def _can_run(vendor: str) -> bool:
+    return not _VENDOR_KEYS.get(vendor) or bool(os.environ.get(_VENDOR_KEYS[vendor]))
+
+
 def parse_vendors(values: list[str] | None) -> dict[str, str]:
     """``["core_stock_apis=alpha_vantage"]`` -> ``{"core_stock_apis": "alpha_vantage"}``, each one checked.
 
-    A category must exist and every vendor in its chain (``yfinance,alpha_vantage``)
-    must serve at least one of the category's methods, so a typo stops the run
-    before any model is called.
+    A category must exist, every vendor in its chain (``yfinance,alpha_vantage``) must
+    serve at least one of the category's methods, and every method must be served by a
+    vendor of the chain that can run here (Alpha Vantage needs its key), unless it has a
+    vendor of its own in ``tool_vendors``: the run would end at a tool none can serve, so
+    a bad choice stops it before any model is called.
     """
     from tradingagents.dataflows.router import TOOLS_CATEGORIES, VENDOR_METHODS
+    from tradingagents.default_config import DEFAULT_CONFIG
 
     chosen: dict[str, str] = {}
     for value in values or []:
@@ -115,21 +126,44 @@ def parse_vendors(values: list[str] | None) -> dict[str, str]:
             raise ValueError(f"--vendor takes category=vendor, got {value!r}")
         if category not in TOOLS_CATEGORIES:
             raise ValueError(f"unknown data category {category!r}; choose from {', '.join(TOOLS_CATEGORIES)}")
-        served = {v for method in TOOLS_CATEGORIES[category]["tools"] for v in VENDOR_METHODS.get(method, {})}
-        unknown = [v for v in (v.strip() for v in chain.split(",")) if v and v not in served]
+        methods = TOOLS_CATEGORIES[category]["tools"]
+        served = {v for method in methods for v in VENDOR_METHODS.get(method, {})}
+        vendors = [v for v in (v.strip() for v in chain.split(",")) if v]
+        unknown = [v for v in vendors if v not in served]
         if unknown:
             raise ValueError(f"{category} has no vendor {', '.join(unknown)}; choose from {', '.join(sorted(served))}")
+        own = DEFAULT_CONFIG.get("tool_vendors") or {}
+        unserved = [m for m in methods if m not in own
+                    and not any(v in VENDOR_METHODS.get(m, {}) and _can_run(v) for v in vendors)]
+        if unserved:
+            blocked = [v for v in vendors if not _can_run(v)]
+            # Another vendor serving all of them, Yahoo where it can: the default, and needing no key.
+            others = sorted(served - set(vendors), key=lambda v: (v != "yfinance", v))
+            fallback = next((v for v in others
+                             if _can_run(v) and all(v in VENDOR_METHODS.get(m, {}) for m in unserved)), None)
+            raise ValueError(_unserved(category, chain, unserved, blocked, fallback))
         chosen[category] = chain
     return chosen
 
 
-def parse_analysis_date(value: str) -> str:
-    """An analysis date as YYYY-MM-DD, today or earlier."""
+def _unserved(category: str, chain: str, methods: list[str], blocked: list[str], fallback: str | None) -> str:
+    """Why ``--vendor category=chain`` leaves ``methods`` without a vendor, and how to fix it."""
+    if blocked:
+        keys = "; ".join(f"{v} needs {_VENDOR_KEYS[v]}, which is not set" for v in blocked)
+        message = (f"--vendor {category}={chain}: no vendor in it that can run here serves {', '.join(methods)} "
+                   f"({keys}); set the key, or add a vendor")
+    else:
+        message = f"--vendor {category}={chain}: no vendor in it serves {', '.join(methods)}; add one"
+    return message + (f", e.g. --vendor {category}={chain},{fallback}" if fallback else "")
+
+
+def parse_analysis_date(value: str, today: datetime.date | None = None) -> str:
+    """An analysis date as YYYY-MM-DD, ``today`` (by default the machine's date) or earlier."""
     try:
         day = datetime.datetime.strptime(value.strip(), "%Y-%m-%d").date()
     except ValueError:
         raise ValueError(f"not a date: {value!r}; use YYYY-MM-DD") from None
-    if day > datetime.date.today():
+    if day > (today or datetime.date.today()):
         raise ValueError(f"{value} is in the future")
     return day.isoformat()
 
@@ -301,7 +335,7 @@ def _fetch_openrouter_models() -> list[tuple[str, str]]:
         models.sort(key=lambda m: m.get("created") or 0, reverse=True)
         return [(m.get("name") or m["id"], m["id"]) for m in models]
     except Exception as e:
-        console.print(f"\n[yellow]Could not fetch OpenRouter models: {e}[/yellow]")
+        console.print(f"\n[yellow]Could not fetch OpenRouter models: {escape(str(e))}[/yellow]")
         return []
 
 

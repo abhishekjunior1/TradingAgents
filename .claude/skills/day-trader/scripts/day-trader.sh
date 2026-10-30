@@ -6,8 +6,9 @@
 # Usage: day-trader.sh TICKER [nse|bse]    (the exchange defaults to nse)
 #
 # TradingAgents runs as "$TRADINGAGENTS_PYTHON -m cli.main" when that is set, else
-# as the tradingagents command on PATH, else as "python3 -m cli.main", always from
-# the repo root: the CLI reads .env from its working directory.
+# as the tradingagents command on PATH, else with the repo's .venv/bin/python or
+# python3 as "python -m cli.main", always from the repo root: the CLI reads .env
+# from its working directory. A Python it runs with must be 3.11 or later.
 
 set -u
 unset CDPATH   # a relative cd must not land elsewhere, or print where it went
@@ -47,16 +48,41 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || die "cannot
 repo_root=$(cd -- "$script_dir/../../../.." && pwd -P) || die "cannot find the repo root" 1
 venv_hint="for example $repo_root/.venv/bin/python"
 
+py=
 if [ -n "${TRADINGAGENTS_PYTHON:-}" ]; then
-    command -v -- "$TRADINGAGENTS_PYTHON" > /dev/null 2>&1 \
+    py=$TRADINGAGENTS_PYTHON
+    # A relative path names a file here, not in the repo root the CLI runs from.
+    case $py in
+        /*) ;;
+        */*) py=$PWD/${py#./} ;;
+    esac
+    command -v -- "$py" > /dev/null 2>&1 \
         || die "TRADINGAGENTS_PYTHON does not name a program that can run; set it to the Python of the environment TradingAgents is installed in ($venv_hint)" 1
-    run=("$TRADINGAGENTS_PYTHON" -m cli.main)
 elif command -v tradingagents > /dev/null 2>&1; then
     run=(tradingagents)
-elif command -v python3 > /dev/null 2>&1; then
-    run=(python3 -m cli.main)
 else
-    die "found no way to run TradingAgents: set TRADINGAGENTS_PYTHON to the Python of its environment ($venv_hint) or put the tradingagents command on PATH" 1
+    if [ -x "$repo_root/.venv/bin/python" ]; then
+        py=$repo_root/.venv/bin/python
+    elif command -v python3 > /dev/null 2>&1; then
+        py=python3
+    else
+        die "found no way to run TradingAgents: set TRADINGAGENTS_PYTHON to the Python of its environment ($venv_hint) or put the tradingagents command on PATH" 1
+    fi
+fi
+if [ -n "$py" ]; then
+    # Whichever Python was chosen may be too old (macOS's python3 is 3.9, and TRADINGAGENTS_PYTHON
+    # may name it), and the run would end in an ImportError. The repo's .venv is not suggested
+    # when it is the one refused, by whatever name or path (python3, a linked folder): the
+    # folders are compared once resolved.
+    hint=" ($venv_hint)"
+    venv_dir=$(cd -P -- "$repo_root/.venv/bin" 2> /dev/null && pwd -P)
+    if [ -n "$venv_dir" ] && py_path=$(command -v -- "$py") \
+            && [ "$(cd -P -- "$(dirname -- "$py_path")" 2> /dev/null && pwd -P)" = "$venv_dir" ]; then
+        hint=
+    fi
+    "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' < /dev/null > /dev/null 2>&1 \
+        || die "$py is not Python 3.11 or later, which TradingAgents needs; set TRADINGAGENTS_PYTHON to the Python of its environment$hint" 1
+    run=("$py" -m cli.main)
 fi
 
 cd -- "$repo_root" || die "cannot enter $repo_root" 1

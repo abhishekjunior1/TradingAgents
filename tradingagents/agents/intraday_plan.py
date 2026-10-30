@@ -160,8 +160,10 @@ def plan_from_fields(fields: Mapping, context: Mapping | None, decided_at: datet
     One that leaves the plan no bar to trade, not after the session's open or
     not after the moment a plan made during its session was made ("3:55" meant
     as 3:55 pm reads 03:55), is replaced by the square-off, or the session
-    close, with a note. A free-text line given but not readable (``unread`` in
-    ``fields``, from ``parse_plan_lines``) is left out, with a note.
+    close, with a note. When the square-off itself leaves no bar (the plan was
+    made after it), the note says the plan cannot trade. A free-text line given
+    but not readable (``unread`` in ``fields``, from ``parse_plan_lines``) is
+    left out, with a note.
     The plan is otherwise kept as given: a direction the ``rating`` does not
     call for, a long or short the replay cannot score (no entry, or a stop or
     target on the wrong side of it), or more shares than ``sizing`` (capital,
@@ -174,8 +176,18 @@ def plan_from_fields(fields: Mapping, context: Mapping | None, decided_at: datet
              for key, label in INTRADAY_PLAN_LABELS.items() if key in unread and key != "direction"]
     valid_from = _valid_from(context, decided_at or _now())
     square_off = context.get("exit_by")
+    # The replay's own test, so the decision says now what the score will.
+    problem = (plan_problem(plan["direction"], plan["entry_price"], plan["stop_loss"], plan["target_price"])
+               if plan["direction"] in ("long", "short") else None)
+    # A square-off that leaves no bar (the plan was made after it) leaves none for any exit-by.
+    closed = _no_bar_before(square_off, context, valid_from) if square_off else None
     no_bar = _no_bar_before(plan["exit_by"], context, valid_from) if plan["exit_by"] else None
-    if plan["exit_by"] and square_off and plan["exit_by"] > square_off:
+    if closed:
+        if plan["direction"] in ("long", "short"):
+            notes.append(f"the {square_off} square-off {closed}, so the plan cannot trade"
+                         + ("" if problem else " and is scored as not triggered"))
+        plan["exit_by"] = square_off
+    elif plan["exit_by"] and square_off and plan["exit_by"] > square_off:
         notes.append(f"the plan's exit-by {plan['exit_by']} is after the {square_off} square-off, "
                      f"so it is scored to {square_off}")
         plan["exit_by"] = square_off
@@ -191,9 +203,6 @@ def plan_from_fields(fields: Mapping, context: Mapping | None, decided_at: datet
     elif rating in _RATING_DIRECTIONS and plan["direction"] not in _RATING_DIRECTIONS[rating]:
         notes.append(f"the direction {plan['direction']} does not follow the {rating} rating; "
                      "the plan is scored as given")
-    # The replay's own test, so the decision says now what the score will.
-    problem = (plan_problem(plan["direction"], plan["entry_price"], plan["stop_loss"], plan["target_price"])
-               if plan["direction"] in ("long", "short") else None)
     if problem:
         notes.append(f"{problem}, so it is scored as no trade")
     size_note = _size_note(plan, context, sizing) if sizing and not problem else None

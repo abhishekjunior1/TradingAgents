@@ -259,3 +259,14 @@ def test_a_historical_indian_run_is_told_its_own_day_not_today():
 def test_a_us_run_gets_the_evidence_rules_but_no_indian_briefing():
     text = build_instrument_context("AAPL", "stock", {}, trade_date=None)
     assert "Evidence rules:" in text and "Market:" not in text and "INR" not in text
+
+
+@pytest.mark.unit
+def test_a_bse_listing_is_read_against_sensex_like_the_rest_of_its_run(yahoo):
+    """Its market line, report header, settlement and watchlist columns use SENSEX; the
+    relative lines read it against NIFTY 50, the plan's first series."""
+    yahoo["^BSESN"] = _frame(AS_OF, step=0.002)
+    bse = market_context.get_market_context("RELIANCE.BO", AS_OF)
+    assert "- vs BSE SENSEX (^BSESN): 1M" in bse and "- vs NIFTY 50 (^NSEI)" not in bse
+    nse = market_context.get_market_context("RELIANCE.NS", AS_OF)
+    assert "- vs NIFTY 50 (^NSEI): 1M" in nse and "- vs BSE SENSEX (^BSESN)" not in nse

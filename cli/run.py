@@ -9,6 +9,7 @@ from pathlib import Path
 
 import typer
 from rich.live import Live
+from rich.markup import escape
 
 from cli.arena import check_before_run, offer_paper_trade
 from cli.display import (
@@ -26,6 +27,7 @@ from cli.display import (
 from cli.selections import depth_from_env, get_user_selections, unattended_gaps
 from cli.stats_handler import StatsCallbackHandler
 from tradingagents.agents.rating import is_review, run_rating
+from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
@@ -106,7 +108,12 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     return config
 
 
-def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
+def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None, benchmark_closes=None):
+    """Ask the setup questions, run the analysis in the live view, then offer the reports.
+
+    ``benchmark_closes`` holds what the check of the run's benchmark before the questions
+    fetched, so the graph's own checks are answered from it.
+    """
     flags = flags or {}
     # With no terminal nothing can answer a prompt: name every question still
     # open before any model is called, rather than stopping at the first one.
@@ -142,12 +149,19 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
     analyst_execution_plan = build_analyst_execution_plan(selected_analyst_keys)
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
-    graph = TradingAgentsGraph(
-        selected_analyst_keys,
-        config=config,
-        debug=True,
-        callbacks=[stats_handler],
-    )
+    try:
+        graph = TradingAgentsGraph(
+            selected_analyst_keys,
+            config=config,
+            debug=True,
+            callbacks=[stats_handler],
+            benchmark_closes=benchmark_closes,
+        )
+    except (ValueError, VendorUnavailableError) as exc:
+        # A setting the graph refuses (the charges, the tax rules, the benchmark): its message
+        # says what to fix, and a traceback adds nothing to it.
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
 
     message_buffer.init_for_analysis(selected_analyst_keys)
 
@@ -208,7 +222,7 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
 
     # The alternate screen keeps a layout taller than the window from redrawing
     # by scrolling; the final report prints after this block, on the normal screen.
-    with Live(layout, refresh_per_second=4, screen=True):
+    with Live(layout, refresh_per_second=4, screen=True) as live:
         # Initial display
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
@@ -238,9 +252,16 @@ def run_analysis(checkpoint: bool | None = None, portfolio=None, flags=None):
         # The same initial state propagate() builds, with the resolved
         # instrument identity; the graph's Memory Log step settles past
         # decisions and loads their lessons alongside the analysts.
-        init_agent_state = graph.create_run_state(
-            selections["ticker"], selections["analysis_date"], selections["asset_type"], portfolio
-        )
+        try:
+            init_agent_state = graph.create_run_state(
+                selections["ticker"], selections["analysis_date"], selections["asset_type"], portfolio
+            )
+        except (ValueError, VendorUnavailableError) as exc:
+            # A benchmark with no prices at a date typed at the prompt. Said once the live view
+            # has given the screen back: printed on its screen, the line would go with it.
+            live.stop()
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            raise typer.Exit(code=1) from None
         plan_for = horizon_line(init_agent_state)
         if plan_for:
             message_buffer.add_message("System", f"Decision horizon: {plan_for}")
@@ -482,7 +503,7 @@ def _offer_reports(final_state, graph, ticker, save=None, show=None, html=None):
             console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
             console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
         except Exception as e:
-            console.print(f"[red]Error saving report: {e}[/red]")
+            console.print(f"[red]Error saving report: {escape(str(e))}[/red]")
         if saved and html:
             page = (save_path / "complete_report.html").resolve()
             console.print(f"  [dim]HTML report:[/dim] {page.name}")

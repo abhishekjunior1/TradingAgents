@@ -12,11 +12,13 @@ from tradingagents.agents.context import build_instrument_context, resolve_instr
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
+from tradingagents.dataflows.errors import VendorUnavailableError
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.dataflows.vendors.yahoo.intraday import plan_session
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 from tradingagents.default_config import DECISION_HORIZONS, DEFAULT_CONFIG, with_agent_reach_news
 from tradingagents.llm_clients import create_tier_client, tier_provider
+from tradingagents.markets import costs
 from tradingagents.markets.intraday import configured_intraday_costs
 from tradingagents.memory import TradingMemoryLog, settlement
 from tradingagents.memory.reflection import Reflector
@@ -55,6 +57,29 @@ def decision_horizon(config) -> str:
     return horizon
 
 
+def _decision_benchmark(company_name, config, trade_date=None, seen=None) -> str:
+    """The benchmark a swing decision is stored with: the run's own (--benchmark), else its listing's.
+
+    The run's own is checked at the run's date before the run (``check_benchmark``),
+    and again here at that date: from ``seen``, the closes that check kept, so with
+    no request, or from Yahoo for a graph not built that way. One with no prices
+    would leave the decision pending for good, so its listing's index is stored
+    instead, with a warning.
+    """
+    benchmark = settlement.resolve_benchmark(company_name, config)
+    if not config.get("benchmark_ticker"):
+        return benchmark
+    try:
+        return settlement.check_benchmark(benchmark, config, as_of=trade_date, seen=seen)
+    except ValueError as exc:
+        listing = settlement.resolve_benchmark(company_name, {**config, "benchmark_ticker": None})
+        logger.warning("The decision on %s is measured against %s, its listing's index, instead of %s: %s",
+                       company_name, listing, benchmark, exc)
+        return listing
+    except VendorUnavailableError:
+        return benchmark    # Yahoo could not be asked: the check before the run stands
+
+
 # Config keys that do not change what a run writes: where it keeps its files,
 # whether it checkpoints, how often it retries a provider, and whether the CLI
 # offers its decision to AlphArena afterwards.
@@ -74,6 +99,7 @@ class TradingAgentsGraph:
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        benchmark_closes: dict | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -82,6 +108,8 @@ class TradingAgentsGraph:
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
+            benchmark_closes: The ``seen`` of a benchmark check made before the graph (the CLI's,
+                before its questions), so the graph's checks are answered from the closes it fetched
         """
         self.debug = debug
         # agent_reach_enabled set in a config, rather than by the environment the
@@ -95,6 +123,18 @@ class TradingAgentsGraph:
         # A mistyped intraday charges profile or override fails here, not in a plan's
         # sizing or in a later settlement (any run may settle an intraday plan).
         configured_intraday_costs(self.config)
+        # So do the delivery charges and the capital-gains rules, which would otherwise drop
+        # every risk figure from a run on a book holding NSE/BSE listings, with only a log line.
+        costs.get_cost_profile(self.config.get("cost_profile"), self.config.get("cost_overrides"))
+        costs.get_capital_gains_rules(self.config.get("capital_gains_rules"),
+                                      self.config.get("capital_gains_overrides"))
+        # So does a benchmark Yahoo has no prices for: a decision stored with it would stay
+        # pending for good, fetched again and reported unsettled by every later run. The
+        # closes it fetches are kept: checked again at a run's date, it is asked for only
+        # from an older one (a backtest's first cell).
+        self._benchmark_closes = {} if benchmark_closes is None else benchmark_closes
+        if self.config.get("benchmark_ticker") and horizon != "intraday":     # a plan has no benchmark
+            settlement.check_benchmark(self.config["benchmark_ticker"], self.config, seen=self._benchmark_closes)
         self.callbacks = callbacks or []
 
         set_config(self.config)
@@ -316,6 +356,8 @@ class TradingAgentsGraph:
             # could also read web pages and videos through Agent-Reach.
             "agent_reach_enabled": bool(cfg.get("agent_reach_enabled")),
             "decision_horizon": decision_horizon(cfg),
+            # The index a swing decision is measured against when not its listing's (--benchmark).
+            "benchmark_ticker": cfg.get("benchmark_ticker"),
         }
 
     def save_reports(self, final_state, ticker, save_path=None, html=True) -> Path:
@@ -341,6 +383,8 @@ class TradingAgentsGraph:
         memory log's lessons are not here: the graph's Memory Log step settles
         and loads them alongside the analysts (see ``_memory_step``). An
         intraday run also fixes the session its plan is for (``intraday_context``).
+        A swing run's own benchmark must be priced at its date: one that is not
+        raises ValueError here, before the run starts.
         """
         trade_date = _validate_trade_date(trade_date)
         intraday = {}
@@ -350,6 +394,11 @@ class TradingAgentsGraph:
                                  "crypto trades around the clock, and its sessions are not modelled")
             intraday = {"decision_horizon": "intraday",
                         "intraday_context": self._intraday_context(company_name, trade_date)}
+        elif self.config.get("benchmark_ticker"):
+            # The decision is stored with the run's benchmark, so it must be priced at the run's date,
+            # not only lately: one listed since (a new ETF) would leave a backtest cell pending for good.
+            settlement.check_benchmark(self.config["benchmark_ticker"], self.config, as_of=trade_date,
+                                       seen=getattr(self, "_benchmark_closes", None))
         return self.propagator.create_initial_state(
             company_name,
             trade_date,
@@ -373,9 +422,13 @@ class TradingAgentsGraph:
             return {"note": f"the plan's session could not be worked out ({type(exc).__name__})"}
 
     def _portfolio_value(self, ticker: str, trade_date: str, portfolio) -> float | None:
-        """The book's value for paper sizing (holdings at their last close plus cash), or None."""
+        """The book's value on the run date for paper sizing (holdings at their last close plus cash), or None.
+
+        It counts the lots ``_portfolio_context`` shows: in a past-dated run, none acquired after its date.
+        """
         try:
-            return book_value(portfolio, ticker, lambda symbol: load_ohlcv(symbol, trade_date))
+            book = portfolio.held_on(trade_date) if is_historical(trade_date, ticker) else portfolio
+            return book_value(book, ticker, lambda symbol: load_ohlcv(symbol, trade_date))
         except Exception as exc:  # noqa: BLE001 — sizing then uses the configured paper capital
             logger.warning("Portfolio value unavailable: %s", exc)
             return None
@@ -384,9 +437,15 @@ class TradingAgentsGraph:
         """The book as the decision agents see it: its holdings, then its risk figures.
 
         The figures are computed from prices up to the run date; if they cannot
-        be, the holdings alone are given, as before.
+        be, the holdings alone are given, as before. A past-dated run does not
+        show a lot acquired after its date as held: the risk block, given the
+        whole book, says it left such lots out. A current run (not
+        ``is_historical`` on the listing's day) counts every lot, the book being
+        today's: a lot written down with its IST date can be dated a day after a
+        US run dated by New York's day.
         """
-        text = portfolio.render(ticker)
+        historical = is_historical(trade_date, ticker)
+        text = (portfolio.held_on(trade_date) if historical else portfolio).render(ticker)
         if not self.config.get("portfolio_risk", True):
             return text
         try:
@@ -394,7 +453,7 @@ class TradingAgentsGraph:
                 portfolio, ticker, trade_date,
                 prices=lambda symbol: load_ohlcv(symbol, trade_date),
                 sector_of=lambda symbol: resolve_instrument_identity(symbol).get("sector"),
-                config=self.config,
+                config=self.config, historical=historical,
             )
         except Exception as exc:  # noqa: BLE001 — the figures are an aid; the holdings still reach the agents
             logger.warning("Portfolio risk figures unavailable: %s", exc)
@@ -461,13 +520,21 @@ class TradingAgentsGraph:
             logger.warning("No final decision for %s on %s; nothing added to the memory log",
                            company_name, trade_date)
             return
-        # An intraday run's plan goes with it, tagged intraday, for its own settlement.
+        # An intraday run's plan goes with it, tagged intraday, for its own settlement. A swing
+        # decision keeps the benchmark this run measures it against (--benchmark, else its
+        # listing's index), for whichever later run settles it.
         intraday = final_state.get("decision_horizon") == "intraday"
-        self.memory_log.store_decision(
+        horizon = ({"intraday_plan": final_state.get("intraday_plan") or {}} if intraday
+                   else {"benchmark": _decision_benchmark(company_name, getattr(self, "config", {}), trade_date,
+                                                          getattr(self, "_benchmark_closes", None))})
+        stored = self.memory_log.store_decision(
             ticker=company_name, trade_date=trade_date, final_trade_decision=decision,
-            rating=run_rating(final_state),
-            **({"intraday_plan": final_state.get("intraday_plan") or {}} if intraday else {}),
+            rating=run_rating(final_state), **horizon,
         )
+        if stored is False:
+            logger.warning("The memory log already holds a %s decision for %s on %s; this run's is not added, "
+                           "so it will not be settled or scored", "intraday" if intraday else "swing",
+                           company_name, trade_date)
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
                    checkpoint_thread_id: str | None = None, portfolio=None):

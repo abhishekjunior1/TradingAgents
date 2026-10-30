@@ -29,7 +29,12 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.date_window import is_historical
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.files import replace_file
-from tradingagents.dataflows.symbols import is_us_listing, normalize_symbol, safe_ticker_component
+from tradingagents.dataflows.symbols import (
+    crypto_quote_currency,
+    is_us_listing,
+    normalize_symbol,
+    safe_ticker_component,
+)
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import MAX_OHLCV_STALE_DAYS, load_ohlcv
 from tradingagents.markets import india, intraday
@@ -328,6 +333,19 @@ def _daily(canonical: str, as_of_date: str) -> tuple[pd.DataFrame | None, str | 
         return None, f"Daily bars unavailable, so the daily ATR is too ({exc})."
 
 
+# Indices Yahoo lists without a caret, as the default benchmark_map names them.
+_CARETLESS_INDICES = frozenset({"000001.SS", "399001.SZ", "FTSEMIB.MI"})
+
+
+def _dividend_adjusted(canonical: str) -> bool:
+    """Whether ``_daily``'s rows for ``canonical`` can be dividend-adjusted: not an index's (some NSE
+    indices, such as NIFTY_FIN_SERVICE.NS, have no caret), a currency's, a future's or a crypto pair's,
+    which pay no dividend, so Yahoo leaves their rows as printed."""
+    upper = canonical.upper()
+    return not (upper.startswith("^") or upper in india.INDEX_BY_SYMBOL or upper in _CARETLESS_INDICES
+                or upper.endswith(("=X", "=F")) or crypto_quote_currency(upper) is not None)
+
+
 def _sizing_examples(levels: dict, exchange: Exchange | None, config: dict, capital: float | None) -> list[dict]:
     """Paper sizes for a long and a short at the newest price, with stops 1 and 2 x the bars' ATR away."""
     reference, atr = levels.get("reference_price"), levels.get("atr_intraday")
@@ -363,10 +381,25 @@ def _trading_now(exchange: Exchange | None, as_of: date, now: datetime, zone,
 
 
 def _notes(meta: IntradayMeta, exchange: Exchange | None, as_of: date, levels: dict, now: datetime,
-           square_off: time | None, trading: bool, daily_note: str | None) -> list[str]:
+           square_off: time | None, trading: bool, daily_note: str | None, *, daily_adjusted: bool) -> list[str]:
     notes = ["Yahoo's intraday bars come through the unofficial yfinance library: regular session only, labelled "
              "by their start, not dividend-adjusted; the official open and close can differ slightly from the "
              "first and last bar."]
+    # load_ohlcv serves the daily rows dividend-adjusted (auto_adjust), which on an ex-date
+    # lowers the prices before it; the unadjusted ones are not at hand to use instead. The
+    # snapshot labels every figure taken from them, and one of these notes says what that means.
+    if daily_adjusted and (levels.get("last_session") or {}).get("source") == "daily bar":
+        # Both gaps are then measured against that bar's close, so this note covers them too.
+        notes.append("The bars hold no session before the plan's, so the last session was read from Yahoo's "
+                     "daily bar, which is dividend-adjusted (the intraday bars are not): on an ex-dividend day its "
+                     "prices are the ones that traded less about the dividend, so the pivots from it sit about the "
+                     "dividend lower, and a gap measured against its close reads higher than it traded by about "
+                     "the dividend yield.")
+    elif daily_adjusted and levels.get("official_gap"):
+        notes.append("The gap at the opening price is measured against Yahoo's daily close, which is "
+                     "dividend-adjusted (the intraday bars are not): on an ex-dividend day that close is the one "
+                     "that traded less the dividend, so the gap reads higher than it traded by about the dividend "
+                     "yield.")
     zone = exchange.tz if exchange is not None else ZoneInfo(meta.timezone)
     local = now.astimezone(zone)
     # Only a run dated today plans the rest of today's session; a past-dated one plans as of its date's close.
@@ -376,7 +409,9 @@ def _notes(meta: IntradayMeta, exchange: Exchange | None, as_of: date, levels: d
                      "take no new intraday positions today, so a plan for the rest of today's session cannot be "
                      "acted on.")
     if exchange is not None:
-        notes.append(f"{exchange.code} hours in force on {as_of:%d %b %Y}: {india.session_rules(as_of)}.")
+        # A special session on other hours (Muhurat trading) is held to the hours the calendar
+        # gives it, not the regular session's rules.
+        notes.append(f"{exchange.code} hours in force on {as_of:%d %b %Y}: {india.hours_in_force(exchange, as_of)}.")
         notes.append("Yahoo carries no pre-open trades, so the first bar can show little or no volume. Intraday "
                      "(MIS) positions are squared off the same day; short selling is allowed intraday only.")
         # Today's state for a run dated today; a past run is told only about its own day.
@@ -435,10 +470,12 @@ def get_intraday_bars(symbol: str, as_of_date: str, interval: str = "5m", sessio
         hours = intraday.infer_session_hours(completed, interval)
     target = intraday.target_session(exchange, as_of, now, tz=zone, hours=hours)
     daily, daily_note = _daily(canonical, as_of.isoformat())
-    levels = intraday.intraday_levels(bars, daily, target[0], now, interval=interval, exchange=exchange)
+    levels = intraday.intraday_levels(bars, daily, target[0], now, interval=interval, exchange=exchange,
+                                      cutoff=meta.cutoff)
     square_off = intraday.square_off_time(exchange, config)
     trading = _trading_now(exchange, as_of, now, zone, hours)
-    notes = _notes(meta, exchange, as_of, levels, now, square_off, trading, daily_note)
+    adjusted = _dividend_adjusted(canonical)
+    notes = _notes(meta, exchange, as_of, levels, now, square_off, trading, daily_note, daily_adjusted=adjusted)
     notes.append(f"Paper capital: {capital_source or 'given for this run'}." if capital else
                  "Paper capital: intraday_paper_capital, a configured paper notional, not an account balance.")
     return intraday.format_intraday_snapshot(
@@ -447,6 +484,7 @@ def get_intraday_bars(symbol: str, as_of_date: str, interval: str = "5m", sessio
         notes,
         recent_bars=bars, source=SOURCE,
         fetched_at=meta.fetched_at if meta.live else None,
+        daily_adjusted=adjusted,    # load_ohlcv's rows are auto_adjust=True
     )
 
 

@@ -2,6 +2,7 @@
 
 import datetime
 import os
+import sys
 from pathlib import Path
 
 import typer
@@ -51,7 +52,10 @@ from tradingagents.markets.exchanges import exchange_for_symbol, session_status
 def get_user_selections(flags=None):
     """Ask for the run's settings, offering the previous run's answers."""
     selections = _prompt_selections(load_last_run(), flags or {})
-    save_last_run(selections)
+    # The answers are offered back at the next run's prompts. A run without a terminal
+    # (a scheduled job, the /day-trader skill) asked nothing, so it leaves them as they were.
+    if sys.stdin.isatty():
+        save_last_run(selections)
     return selections
 
 
@@ -66,6 +70,22 @@ def run_horizon(flags) -> str:
     return flags.get("horizon") or DEFAULT_CONFIG.get("decision_horizon") or "swing"
 
 
+def _on_openai(provider: str | None) -> bool:
+    return (provider or "").strip().lower() == "openai"
+
+
+def models_still_needed(provider: str | None) -> list[str]:
+    """The TRADINGAGENTS_*_THINK_LLM variables to set before both tiers' models are known.
+
+    The built-in models (gpt-6-luna, gpt-6-sol) are OpenAI's: on openai one variable is
+    enough, the other tier keeping its built-in model; on another provider a tier without
+    its variable has no model at all.
+    """
+    missing = [f"TRADINGAGENTS_{tier}_THINK_LLM" for tier in ("QUICK", "DEEP")
+               if not os.environ.get(f"TRADINGAGENTS_{tier}_THINK_LLM")]
+    return [] if _on_openai(provider) and len(missing) < 2 else missing
+
+
 def unattended_gaps(flags) -> list[str]:
     """The flags and environment variables a run with no terminal still needs."""
     env = os.environ.get
@@ -77,10 +97,12 @@ def unattended_gaps(flags) -> list[str]:
         gaps.append("TRADINGAGENTS_OUTPUT_LANGUAGE")
     if not depth_from_env():
         gaps.append("TRADINGAGENTS_MAX_DEBATE_ROUNDS and TRADINGAGENTS_MAX_RISK_ROUNDS")
-    if not env("TRADINGAGENTS_LLM_PROVIDER"):
+    provider = env("TRADINGAGENTS_LLM_PROVIDER")
+    if not provider:
         gaps.append("TRADINGAGENTS_LLM_PROVIDER")
-    if not (env("TRADINGAGENTS_QUICK_THINK_LLM") or env("TRADINGAGENTS_DEEP_THINK_LLM")):
-        gaps.append("TRADINGAGENTS_QUICK_THINK_LLM or TRADINGAGENTS_DEEP_THINK_LLM")
+    models = models_still_needed(provider)
+    if models:
+        gaps.append((" or " if _on_openai(provider) else " and ").join(models))
     return gaps
 
 
@@ -107,7 +129,7 @@ def _check_tier_providers(main_provider: str, backend_url: str | None = None) ->
         try:
             check_endpoint(provider, url)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
+            console.print(f"[red]{escape(str(exc))}[/red]")
             raise typer.Exit(code=1) from None
         if provider not in used:
             used.append(provider)
@@ -121,7 +143,7 @@ def _from_flag(parse, value, *args):
     try:
         return parse(value, *args)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(code=1) from None
 
 
@@ -337,8 +359,10 @@ def _prompt_selections(prefs, flags):
 
     _check_tier_providers(selected_llm_provider, backend_url)
 
-    # Step 7: Thinking agents (skipped when either model is set via environment)
-    if os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
+    # Step 7: Thinking agents. A model its variable sets is not asked for; on openai one
+    # variable skips the step, the other tier keeping its built-in model.
+    models_needed = models_still_needed(selected_llm_provider)
+    if not models_needed:
         selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
         selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
         console.print(
@@ -352,12 +376,20 @@ def _prompt_selections(prefs, flags):
             )
         )
         remembered = prefs if prefs.get("llm_provider") == selected_llm_provider else {}
-        selected_shallow_thinker = select_shallow_thinking_agent(
-            selected_llm_provider, remembered.get("quick_think_llm")
-        )
-        selected_deep_thinker = select_deep_thinking_agent(
-            selected_llm_provider, remembered.get("deep_think_llm")
-        )
+        if "TRADINGAGENTS_QUICK_THINK_LLM" in models_needed:
+            selected_shallow_thinker = select_shallow_thinking_agent(
+                selected_llm_provider, remembered.get("quick_think_llm")
+            )
+        else:
+            selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
+            console.print(f"[green]✓ Quick-thinking model from environment:[/green] {selected_shallow_thinker}")
+        if "TRADINGAGENTS_DEEP_THINK_LLM" in models_needed:
+            selected_deep_thinker = select_deep_thinking_agent(
+                selected_llm_provider, remembered.get("deep_think_llm")
+            )
+        else:
+            selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
+            console.print(f"[green]✓ Deep-thinking model from environment:[/green] {selected_deep_thinker}")
 
     # Step 8: Provider-specific reasoning/thinking configuration. Each knob is
     # settable via its TRADINGAGENTS_* env var; when that var is set (or the
@@ -422,4 +454,4 @@ def get_analysis_date(default: str | None = None):
         try:
             return parse_analysis_date(date_str)
         except ValueError as exc:
-            console.print(f"[red]Error: {exc}[/red]")
+            console.print(f"[red]Error: {escape(str(exc))}[/red]")

@@ -195,8 +195,10 @@ def test_ticker_news_null_feed_is_handled(monkeypatch):
 
 
 def _tagged(title, day, *tickers):
+    # Noon UTC: on ``day`` in New York too, whose days bound a US listing's window
+    # (00:00 UTC is the evening before there).
     return {"title": title, "publisher": "P", "link": "l",
-            "providerPublishTime": _epoch(day), "relatedTickers": list(tickers)}
+            "providerPublishTime": _epoch(day) + 12 * 3600, "relatedTickers": list(tickers)}
 
 
 @pytest.mark.unit

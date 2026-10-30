@@ -35,7 +35,9 @@ or the yt-dlp and node it starts.
 Everything it returns is third-party text. Each output is labelled as untrusted
 and cleaned of control, bidi and invisible tag characters. Titles and names are
 kept to one short line; snippets, page text and captions are cut to lengths you
-set and quoted line by line. Agent-Reach's error messages, hints and update
+set and quoted line by line. A web page's images are left out and its links
+shown as their text before it is cut, so a news site's menus and ad links do not
+use up the length. Agent-Reach's error messages, hints and update
 notices are written for an AI agent to act on; TradingAgents logs them at DEBUG
 only and never passes them to a model.
 
@@ -160,11 +162,13 @@ With it on:
 
 - **News.** When `news_data` is still the default `yfinance`, the run reads
   `agent_reach,yfinance`: Exa first, and Yahoo when Agent-Reach is missing, a
-  search fails or nothing it found is dated in the window. A `news_data` you set
-  in a config, or with `--vendor news_data=...`, is kept as you set it, except
-  `yfinance` itself in a Python config that switches Agent-Reach on (below). The
-  report's "Data vendors" line names the chain the run used, and the run settings
-  in the state log record `agent_reach_enabled`.
+  search fails or nothing it found is dated in the window. The Sentiment Analyst,
+  given the same company news, heads Exa's results as unverified web pages, not
+  as a news publisher's headlines. A `news_data` you set in a config, or with
+  `--vendor news_data=...`, is kept as you set it, except `yfinance` itself in a
+  Python config that switches Agent-Reach on (below). The report's "Data
+  vendors" line names the chain the run used, and the run settings in the state
+  log record `agent_reach_enabled`.
 - **Web pages and videos.** The News Analyst also gets `read_web_page`,
   `get_video_coverage` and `get_video_transcript`, with a sentence on what they
   are for and one saying that their output is third-party content.
@@ -172,7 +176,9 @@ With it on:
 Switched off, the News Analyst's tools and prompt are as they were, and
 Agent-Reach is never started. Naming it in a chain uses it even when switched off:
 `--vendor news_data=agent_reach,yfinance` reads news through it for one run,
-without the web tools. From Python, set `config["agent_reach_enabled"] = True`
+without the web tools. Agent-Reach serves no insider transactions, which share
+the `news_data` category, so `--vendor news_data=agent_reach` alone stops the
+run before it starts. From Python, set `config["agent_reach_enabled"] = True`
 (and `agent_reach_command`). There a `news_data` of `yfinance` cannot be told from
 the default, so it reads `agent_reach,yfinance` too, unless the environment's
 switch is also on; to keep Yahoo's news while the News Analyst gets the web tools,
@@ -201,10 +207,10 @@ Company news searches for `"<company name> stock news"` (with `India` added for
 an NSE/BSE listing, and `crypto news` for a coin), taking the name from Yahoo's
 profile, or the ticker when Yahoo has none. Global news searches
 `global_news_queries`; for an NSE/BSE listing it reports an India section from
-`agent_reach_india_queries` and a Global section, sharing
-`global_news_article_limit` as the Yahoo vendor does. Exa's semantic search
-suits these multi-word topics, unlike Yahoo's keyword search
-([docs/india.md](india.md)).
+`agent_reach_india_queries` (whatever Yahoo's `global_news_queries_india` holds)
+and a Global section, sharing `global_news_article_limit` as the Yahoo vendor
+does. Exa's semantic search suits these multi-word topics, unlike Yahoo's
+keyword search ([docs/india.md](india.md)).
 
 ## Dates and look-ahead
 
@@ -214,15 +220,32 @@ is before today: your machine's date, or the listing's when that is earlier. On
 a machine in India after midnight, a US run dated New York's day is a run dated
 today.
 
+The window's days, and the dates shown, are the listing's: India's for an
+NSE/BSE listing, New York's for a US listing, UTC's otherwise. A time with a zone
+falls on its day there, so a past NSE run reads nothing timed after its date has
+ended in India. A date with no time, or exactly midnight (how Exa writes a
+page that states only a date, such as an RBI press release), counts as that date
+in every listing, and so does a video's upload date. A time with no zone counts
+on the later of the date it states and its date read as UTC in the listing's
+zone, so a past run never reads it early, but is shown on the date it states,
+as `read_web_page` shows it: for an NSE listing, a story timed
+"2026-10-29T21:00" counts as 30 Oct (21:00 UTC is 02:30 IST the next day) and
+is listed as published 2026-10-29.
+
 - **A run dated in the past** keeps only items dated inside its window, and drops
   undated ones. A date with no day or year ("March 2026"), a relative word
-  ("today") or an ambiguous numeric date (05/03/2026, also after a weekday or a
-  time: "Sun 03/05/2026") counts as undated. An offset after GMT or UTC ("GMT-4",
-  "UTC+5:30") is read as hours from UTC, as pages mean it.
+  ("today"), an ambiguous numeric date (05/03/2026, also after a weekday or a
+  time: "Sun 03/05/2026") or a year before 1900 or after 2200 (0001-01-01, which
+  Hugo writes for an undated page, or 9999-12-31) counts as undated. An offset
+  after GMT or UTC ("GMT-4", "UTC+5:30") is read as hours from UTC, as pages
+  mean it.
 - **A run dated today** also keeps undated items, marked "(date not given)".
   Nothing dated after your machine's date is kept.
 - **Web pages:** a live page shows today's content, so `read_web_page` refuses a
-  run dated in the past.
+  run dated in the past. Its "Published:" line gives a time with a zone in the
+  listing's zone, named ("2026-10-30 06:00 IST"), a date alone or midnight as
+  "2026-10-30 (as the page states)", and a time with no zone as "2026-10-30 06:00
+  (as the page states, with no time zone)"; an undated page has no such line.
 - **Videos** are dated by their upload (search results carry no date), with the
   same bounds as news: a past-dated run lists and transcribes only videos
   uploaded by its date, never one without an upload date, and a run dated today
@@ -287,6 +310,14 @@ too.
   kept for the process.
 
 ## Troubleshooting
+
+A setup problem (the first three rows, or a bad setting) is logged as a warning
+that names the tool and gives the message, such as "Vendor 'agent_reach' not
+configured for get_news: Agent-Reach is not installed, ...; trying next
+vendor.", and a failed call likewise as "Vendor 'agent_reach' unavailable for
+get_news: ...; trying next vendor.". News then comes from the next vendor in the
+chain; a web tool, which has no other vendor, tells the News Analyst the data is
+unavailable and why.
 
 | Message | What to do |
 |---|---|

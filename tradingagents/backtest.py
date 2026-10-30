@@ -27,7 +27,7 @@ import tradingagents.default_config as default_config
 from tradingagents.agents.rating import RATING_REVIEW
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.router import TOOLS_CATEGORIES, VENDOR_METHODS
-from tradingagents.dataflows.symbols import safe_ticker_component
+from tradingagents.dataflows.symbols import normalize_symbol, safe_ticker_component
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.memory import TradingMemoryLog
 
@@ -78,6 +78,14 @@ def _alpha(entry: dict) -> float | None:
         return None
 
 
+def _own_benchmark(entry: dict) -> bool:
+    """Whether a decision was measured against the instrument itself (NIFTY 50 against NIFTY 50),
+    so its alpha is zero whatever happened. One logged before benchmarks were recorded cannot
+    tell, and is scored as before."""
+    benchmark = entry.get("benchmark")
+    return bool(benchmark) and normalize_symbol(benchmark) == normalize_symbol(entry["ticker"])
+
+
 @dataclass
 class BacktestResult:
     run_id: str
@@ -107,6 +115,8 @@ class BacktestSummary:
     by_rating: dict[str, RatingScore]
     unscored: int = 0
     holding: str = ""
+    # The instruments of settled cells counted as unscored because each is its own benchmark.
+    own_benchmark: tuple[str, ...] = ()
 
     def render(self) -> str:
         lines = [f"Resolved cells: {self.resolved} · pending: {self.pending}"
@@ -121,6 +131,9 @@ class BacktestSummary:
         lines.append("")
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
+        if self.own_benchmark:
+            lines.append(f"Cells on {', '.join(self.own_benchmark)} are not scored: each was measured against "
+                         "itself, its own benchmark, so its alpha is zero by construction.")
         lines.append(
             f"Alpha is measured over {self.holding} from the first close after each analysis date. "
             "One model sampling per cell, and text feeds are not archived, so "
@@ -267,9 +280,12 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
     # holding period, so a log holding both scores only the swing ratings.
     entries = [e for e in entries if e.get("horizon") != "intraday"]
     # A decision with no readable rating has no direction, so it can neither
-    # count for nor against the system; it is reported as unscored instead.
-    resolved = [(e, _alpha(e)) for e in entries
-                if not e["pending"] and e["rating"] != RATING_REVIEW]
+    # count for nor against the system; it is reported as unscored instead. So
+    # is a settled one measured against itself: "called the direction 0%" for
+    # NIFTY 50 Buys that each rose.
+    rated = [e for e in entries if e["rating"] != RATING_REVIEW]
+    own = [e for e in rated if not e["pending"] and _own_benchmark(e)]
+    resolved = [(e, _alpha(e)) for e in rated if not e["pending"] and not _own_benchmark(e)]
     resolved = [(e, a) for e, a in resolved if a is not None]
     by_rating: dict[str, RatingScore] = {}
     for rating in dict.fromkeys(e["rating"] for e, _ in resolved):
@@ -280,11 +296,12 @@ def summarize(source: BacktestResult | str | Path) -> BacktestSummary:
             hit_rate=(sum(a * direction > 0 for a in alphas) / len(alphas)) if direction else None,
             mean_alpha=sum(alphas) / len(alphas),
         )
-    unscored = sum(1 for e in entries if e["rating"] == RATING_REVIEW)
+    unscored = len(entries) - len(rated) + len(own)
     # Report the window the outcomes were actually measured over, from the log.
     windows = {f"{e['holding'][:-1]} trading days" for e, _ in resolved
                if (e.get("holding") or "").endswith("d")}
     return BacktestSummary(resolved=len(resolved),
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
-                           holding=", ".join(sorted(windows)) or "the configured window")
+                           holding=", ".join(sorted(windows)) or "the configured window",
+                           own_benchmark=tuple(dict.fromkeys(e["ticker"] for e in own)))

@@ -10,6 +10,7 @@ from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.symbols import listing_zone, normalize_symbol, safe_ticker_component
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
+from tradingagents.markets.exchanges import exchange_for_symbol, is_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,12 @@ MAX_OHLCV_STALE_DAYS = 10
 # up today's close soon after it publishes, long enough that a day with no bar
 # at all (weekend, holiday) cannot trigger a download on every call.
 OHLCV_CACHE_TTL_SECONDS = 900
+
+# Calendar days of history a download holds before the requested date: the
+# indicators need about a year of sessions (a 200-day SMA, a 250-session relative
+# return), so a date the 5-year window does not reach that far behind is
+# downloaded from earlier.
+HISTORY_BEFORE_AS_OF_DAYS = 400
 
 
 def _ensure_date_column(data: pd.DataFrame) -> pd.DataFrame:
@@ -88,6 +95,33 @@ def _fill_price_gaps(data: pd.DataFrame) -> pd.DataFrame:
     data = data.dropna(subset=["Close"]).copy()
     data[price_cols] = data[price_cols].ffill().bfill()
     return data
+
+
+def _closed_day_filler(data: pd.DataFrame, canonical: str) -> pd.Series:
+    """Which rows are Yahoo's filler for a day the listing's exchange was closed.
+
+    Yahoo gives some NSE listings a row on an exchange holiday (RELIANCE.NS and
+    M&M.NS on 15 Jan 2026): one price as open, high, low and close, and no
+    volume. Read as a session it adds a zero-range bar to ATR and moves every
+    window by a row. Only such a row on a day the calendar here has closed is
+    filler: a row with trading is kept, holiday or not (NSE's budget session of
+    Saturday 1 Feb 2025 is outside the calendar here), and so is a flat bar on a
+    trading day, an illiquid listing's day without trades. Dates are read from
+    ``Date`` or, without that column, the index.
+    """
+    filler = pd.Series(False, index=data.index)
+    exchange = exchange_for_symbol(canonical)
+    if exchange is None or not {"Open", "High", "Low", "Close", "Volume"} <= set(data.columns):
+        return filler
+    # yfinance's dividend adjustment scales open, high and low by Adj Close / Close but takes
+    # Adj Close itself as the close, which can leave a flat row's prices an ulp apart: they
+    # are compared within a tolerance far below any price tick.
+    close = data["Close"]
+    flat = data[["Open", "High", "Low"]].sub(close, axis=0).abs().le(close.abs() * 1e-9, axis=0).all(axis=1)
+    dates = pd.DatetimeIndex(data["Date"] if "Date" in data.columns else data.index)
+    for position in (flat & (data["Volume"].fillna(0) == 0)).to_numpy().nonzero()[0]:
+        filler.iloc[position] = not is_trading_day(exchange, dates[position].date())
+    return filler
 
 
 def _coerce_ohlcv_dates(data: pd.DataFrame) -> pd.Series:
@@ -172,16 +206,24 @@ def _cache_is_fresh(data_file, as_of_dt, now, zone=None) -> bool:
     return as_of_dt.date() < today or moment.timestamp() - written <= OHLCV_CACHE_TTL_SECONDS
 
 
-def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataFrame:
+def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True, *,
+               max_stale_days: int | None = MAX_OHLCV_STALE_DAYS) -> pd.DataFrame:
     """Fetch OHLCV data with caching, filtered to prevent look-ahead bias.
 
-    Downloads 5 years of data up to today and caches per symbol. On
-    subsequent calls the cache is reused. Rows after as_of_date are
-    filtered out so backtests never see future prices.
+    Downloads 5 years of data up to today, from earlier when as_of_date needs
+    more history before it, and caches per symbol. On subsequent calls the
+    cache is reused. Rows after as_of_date are filtered out so backtests never
+    see future prices, and so are Yahoo's filler rows for days an NSE/BSE
+    listing's exchange was closed.
 
     ``fill_gaps`` carries prices forward over gaps so indicators compute on a
     continuous series. Pass ``False`` to read the values as the vendor reported
     them, leaving a cell that was never reported empty.
+
+    A frame whose newest row is more than ``max_stale_days`` calendar days
+    before as_of_date is refused as stale (#1021). ``None`` serves it, for a
+    caller that keeps only rows from dates of its own, which a stale frame
+    cannot pass off as current prices.
     """
     # Resolve broker/forex symbols (XAUUSD+ -> GC=F) to Yahoo's convention,
     # then reject values that would escape the cache directory when
@@ -192,9 +234,17 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
     config = get_config()
     as_of_dt = pd.to_datetime(as_of_date).normalize()
 
-    # One cache file per symbol, holding the latest 5y-to-today download.
+    # One cache file per symbol, holding the latest 5y-to-today download. A date
+    # the window does not reach far enough behind (a backtest of 2020) downloads
+    # from the start of the year it needs instead, into a file named for that
+    # year: the name says what the file covers, so it is never read as too short.
     now = pd.Timestamp.today()
     start_date = now - pd.DateOffset(years=5)
+    cache_name = f"{safe_symbol}-YFin-data.csv"
+    needed = as_of_dt - pd.Timedelta(days=HISTORY_BEFORE_AS_OF_DAYS)
+    if needed < start_date:
+        start_date = pd.Timestamp(needed.year, 1, 1)
+        cache_name = f"{safe_symbol}-YFin-data-from-{needed.year}.csv"
     start_str = start_date.strftime("%Y-%m-%d")
     # yfinance ``end`` is EXCLUSIVE; request tomorrow so today's row is included
     # when as_of_date is the current day (#986). Look-ahead is still prevented by
@@ -202,10 +252,7 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
     end_str = (now + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
     os.makedirs(config["data_cache_dir"], exist_ok=True)
-    data_file = os.path.join(
-        config["data_cache_dir"],
-        f"{safe_symbol}-YFin-data.csv",
-    )
+    data_file = os.path.join(config["data_cache_dir"], cache_name)
 
     # A cached file may be empty if a prior fetch failed (unknown symbol,
     # transient rate limit). Treat an empty/columnless cache as a miss and
@@ -243,6 +290,12 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
     # Filter to as_of_date to prevent look-ahead bias in backtesting.
     data = data[data["Date"] <= as_of_dt]
 
+    filler = _closed_day_filler(data, canonical)
+    if filler.any():
+        logger.info("%s: left out Yahoo's filler row for closed day(s) %s", canonical,
+                    ", ".join(f"{day:%Y-%m-%d}" for day in data.loc[filler, "Date"]))
+        data = data[~filler]
+
     # A closeless newest bar is an unsettled session, not a symbol without data.
     # _fill_price_gaps below drops it, here and mid-series alike, so the frame
     # ends at the last settled bar; only a range with no close anywhere is no
@@ -266,7 +319,8 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
 
     # Reject a stale frame (latest row far older than as_of_date) rather than
     # feeding year-old prices into indicators (#1021).
-    _assert_ohlcv_not_stale(data, as_of_date, symbol, canonical)
+    if max_stale_days is not None:
+        _assert_ohlcv_not_stale(data, as_of_date, symbol, canonical, max_stale_days=max_stale_days)
 
     return data
 

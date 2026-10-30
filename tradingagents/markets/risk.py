@@ -76,9 +76,23 @@ def beta(asset_closes: pd.Series, benchmark_closes: pd.Series, min_returns: int 
     return float(asset.cov(bench) / variance)
 
 
+def shared_closes(asset_closes: pd.Series, benchmark_closes: pd.Series) -> pd.DataFrame:
+    """The two series' closes on the dates both have, as two columns; a repeated date keeps its last close."""
+    columns = [_clean(closes) for closes in (asset_closes, benchmark_closes)]
+    # A repeated date would make the join raise rather than align.
+    columns = [series[~series.index.duplicated(keep="last")] for series in columns]
+    return pd.concat(columns, axis=1, join="inner")
+
+
 def relative_return(asset_closes: pd.Series, benchmark_closes: pd.Series, sessions: int) -> float | None:
-    """The asset's return minus the benchmark's over the same last ``sessions`` sessions."""
-    asset, bench = total_return(asset_closes, sessions), total_return(benchmark_closes, sessions)
+    """The asset's return minus the benchmark's over the last ``sessions`` sessions both series have.
+
+    Cut from each series' own rows instead, a row only one of them has (a holiday
+    filler, a special session, a close published a day late) would start or end one
+    window on a different day from the other.
+    """
+    shared = shared_closes(asset_closes, benchmark_closes)
+    asset, bench = total_return(shared.iloc[:, 0], sessions), total_return(shared.iloc[:, 1], sessions)
     return None if asset is None or bench is None else asset - bench
 
 

@@ -15,6 +15,7 @@ from markdown_it import MarkdownIt
 from tradingagents.agents.rating import run_rating
 from tradingagents.reporting import (
     analyst_names,
+    benchmark_line,
     disclaimer_for,
     horizon_line,
     is_intraday_run,
@@ -234,9 +235,11 @@ def _group(name: str, values_html: str) -> str:
 def _run_details(final_state: dict, settings: dict | None, ticker: str = "") -> list[tuple[str, str]]:
     """The run details as (label, value HTML); every value from the run is escaped."""
     details = [("Generated", escape(datetime.now().strftime("%Y-%m-%d %H:%M")))]
-    market = market_line(ticker)
+    market = market_line(ticker, final_state, settings)
     if market:
         details.append(("Market", escape(market)))
+    elif (settings or {}).get("benchmark_ticker"):
+        details.append(("Benchmark", escape(benchmark_line(ticker, final_state, settings))))
     if settings:
         s = settings.get
         for tier in ("deep", "quick"):

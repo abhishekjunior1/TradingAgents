@@ -4,9 +4,10 @@
   trade date, so no tool reaches a vendor with a later one, and always hand it
   over as ``YYYY-MM-DD``: vendors compare dates as text.
 - ``in_window`` trims dated items (news, StockTwits, Reddit) to the analysis
-  window: timestamps normalized to UTC, the upper bound exclusive at midnight
-  after ``end``, and an undated item kept only when the window reaches the
-  present, since a backtest cannot prove it is not from the future (#1126, #1220).
+  window: its days are the listing's (``window_zone``), the upper bound exclusive
+  at the listing's midnight after ``end``, and an undated item kept only when the
+  window reaches the present, since a backtest cannot prove it is not from the
+  future (#1126, #1220).
 - ``coverage_gap`` reports a window a feed cannot reach as unavailable, not empty.
 - ``is_historical`` tells a past-dated run from a current one, "today" being the
   listing's date where it is behind the machine's (``today_for``).
@@ -26,15 +27,24 @@ def to_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
 
 
-def in_window(pub_dt: datetime | None, start_dt: datetime, end_dt: datetime) -> bool:
+def in_window(pub_dt: datetime | None, start_dt: datetime, end_dt: datetime, zone=None) -> bool:
     """Whether an item belongs in the half-open window ``[start, end + 1 day)``.
 
-    ``pub_dt`` None means undated: kept only when the window reaches the present.
+    Naive bounds are times in ``zone`` (``window_zone``), else UTC: a past NSE run
+    dated the 29th must not read what India published after its own midnight,
+    18:30 UTC. ``pub_dt`` None means undated: kept only when the window reaches the present.
     """
-    end = to_utc(end_dt)
+    start, end = (dt if dt.tzinfo else dt.replace(tzinfo=zone or UTC)
+                  for dt in (start_dt, end_dt + timedelta(days=1)))
     if pub_dt is not None:
-        return to_utc(start_dt) <= to_utc(pub_dt) < end + timedelta(days=1)
-    return end >= datetime.now(UTC) - timedelta(days=1)
+        return start <= to_utc(pub_dt) < end
+    return end >= datetime.now(UTC)
+
+
+def window_zone(symbol: str | None = None):
+    """The zone whose days bound a window: ``symbol``'s listing's, else the run's
+    (``run_symbol``); None, read as UTC, when it has none (``symbols.listing_zone``)."""
+    return listing_zone(symbol or get_config().get("run_symbol"))
 
 
 def get_current_date() -> str:

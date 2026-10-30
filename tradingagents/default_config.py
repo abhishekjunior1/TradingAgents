@@ -82,16 +82,20 @@ def _is_cost_profile(value: str) -> bool:
 _ENV_NORMALIZE = {
     "decision_horizon": lambda v: v.strip().lower(),
     "arena_mode": lambda v: v.strip().lower(),
+    "cost_profile": lambda v: v.strip().lower(),
     "intraday_cost_profile": lambda v: v.strip().lower(),
 }
 
 # Overrides whose value must also be in range, checked at startup like the type:
 # a mistyped square-off or a zero leverage cap would otherwise leave every
-# intraday snapshot unavailable for the whole run, and a mistyped arena mode
-# would surface only once the run had finished.
+# intraday snapshot unavailable for the whole run, a mistyped arena mode
+# would surface only once the run had finished, and a mistyped charges
+# profile would stop every run only after its setup questions.
 _ENV_CHECKS = {
     "decision_horizon": (lambda v: v in DECISION_HORIZONS, "swing or intraday"),
     "arena_mode": (lambda v: v in ARENA_MODES, "sandbox or live"),
+    "cost_profile": (_is_cost_profile, "a profile in tradingagents/markets/costs.py, "
+                                       "e.g. india_equity_delivery or none"),
     "intraday_square_off": (_is_time_of_day, "a time as HH:MM"),
     "intraday_paper_capital": (lambda v: math.isfinite(v) and v > 0, "a positive amount"),
     "intraday_risk_pct": (lambda v: math.isfinite(v) and 0 < v <= 100, "a percentage above 0 and at most 100"),
@@ -290,9 +294,11 @@ def build_default_config() -> dict:
             # Example: "get_stock_data": "alpha_vantage",  # Override category default
         },
         # Benchmark for alpha calculation in the reflection layer.
-        # ``benchmark_ticker`` (when set) overrides the suffix map for all
-        # tickers; leave it None to use ``benchmark_map`` for auto-detection
-        # based on the ticker's exchange suffix. SPY remains the US default
+        # ``benchmark_ticker`` (when set, e.g. by --benchmark) measures the swing
+        # decisions recorded while it is set: each decision stores its benchmark,
+        # and it is checked before the run. Leave it None to use the exchange's
+        # headline index for NSE/BSE listings and ``benchmark_map`` by suffix
+        # otherwise. SPY remains the US default
         # so the reflection label keeps reading "Alpha vs SPY" for US tickers
         # while non-US tickers get their regional index automatically.
         # Trading days from the first close after the analysis date over which a

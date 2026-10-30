@@ -2,7 +2,8 @@
 
 For an NSE/BSE instrument: NIFTY 50, SENSEX, NIFTY Bank, India VIX, the closest
 NIFTY sector index, USD/INR and Brent crude, with the stock's return relative
-to the benchmark and its sector. Elsewhere: the configured benchmark only.
+to the benchmark and its sector. Elsewhere: the benchmark only, a swing run's own
+(``benchmark_ticker``) or else the listing's index.
 
 Every series is Yahoo's daily closes up to the run date (``load_ohlcv``, so a
 backtest never sees a later close), and every row carries the date of its own
@@ -80,7 +81,11 @@ def _series_plan(symbol: str) -> tuple[list[tuple[str, str]], object]:
         config = get_config()
         suffix = next((s for s in sorted(config.get("benchmark_map", {}), key=len, reverse=True)
                        if s and symbol.endswith(s)), "")
-        benchmark = config.get("benchmark_ticker") or config.get("benchmark_map", {}).get(suffix, "SPY")
+        # A swing run's own benchmark; an intraday plan has none, so its run reads the listing's
+        # index, as its agents are told (agents.context._own_benchmark).
+        intraday = str(config.get("decision_horizon") or "").strip().lower() == "intraday"
+        own = None if intraday else config.get("benchmark_ticker")
+        benchmark = own or config.get("benchmark_map", {}).get(suffix, "SPY")
         return [("Benchmark", benchmark)], None
     plan = [(index.name, index.symbol) for index in
             (india.INDEX_BY_SYMBOL[s] for s in ("^NSEI", "^BSESN", "^NSEBANK", "^INDIAVIX"))]
@@ -130,14 +135,17 @@ def get_market_context(symbol: str, as_of_date: str) -> str:
 
 
 def get_watchlist_snapshot(symbols: list[str], as_of_date: str) -> str:
-    """One row per symbol: last close and its date, changes, and 1M / 3M return against its benchmark."""
+    """One row per symbol: last close and its date, changes, and 1M / 3M return against its benchmark.
+
+    A symbol that cannot be read gets a row saying why; the others are still shown.
+    """
     rows, benchmarks, expected = [], {}, {}
     for raw in symbols:
         symbol = normalize_symbol(raw)
         try:
             closes = _closes(symbol, as_of_date)
-        except VendorError as exc:
-            rows.append(f"| {symbol} | unavailable ({exc}) | | | | | | | |")
+        except (VendorError, ValueError) as exc:   # ValueError: a symbol the loader refuses, e.g. USD/INR
+            rows.append(f"| {symbol} | unavailable ({exc}{_did_you_mean(symbol)}) | | | | | | | |")
             continue
         exchange = exchange_for_symbol(symbol)
         late = ""
@@ -154,8 +162,10 @@ def get_watchlist_snapshot(symbols: list[str], as_of_date: str) -> str:
                 benchmarks[benchmark] = None
         bench = benchmarks[benchmark]
         relative = [risk.relative_return(closes, bench, n) if bench is not None else None for n in (21, 63)]
+        end = _shared_end(closes, bench) if bench is not None else None
+        to = f" (to {end:%d %b})" if end else ""
         changes = " | ".join(format_percent(risk.total_return(closes, n)) for _, n in _WINDOWS)
-        gaps = " | ".join("n/a" if g is None else f"{g * 100:+.1f} pts" for g in relative)
+        gaps = " | ".join("n/a" if g is None else f"{g * 100:+.1f} pts{to}" for g in relative)
         rows.append(f"| {symbol} | {price_text(float(closes.iloc[-1]))} | {closes.index[-1]}{late} | {changes} | "
                     f"{gaps} |")
     return "\n".join([
@@ -177,9 +187,10 @@ def _relative_lines(canonical, as_of_date, plan, loaded, sector) -> list[str]:
     except VendorError as exc:
         return [f"- unavailable: no closes for {canonical} ({exc})"]
     lines = []
-    benchmark_symbol = plan[0][1]
-    for name, symbol in ((plan[0][0], benchmark_symbol),
-                         *(((sector.name, sector.symbol),) if sector is not None else ())):
+    # The listing's own exchange benchmark (SENSEX for a BSE listing), else the plan's first series.
+    exchange = exchange_for_symbol(canonical)
+    benchmark = next(((name, symbol) for name, symbol in plan if exchange and symbol == exchange.benchmark), plan[0])
+    for name, symbol in (benchmark, *(((sector.name, sector.symbol),) if sector is not None else ())):
         closes = loaded.get(symbol)
         if closes is None:
             continue
@@ -187,8 +198,31 @@ def _relative_lines(canonical, as_of_date, plan, loaded, sector) -> list[str]:
         for label, n in (("1M", 21), ("3M", 63), ("1Y", 250)):
             gap = risk.relative_return(own, closes, n)
             cells.append(f"{label} {'n/a' if gap is None else f'{gap * 100:+.1f} pts'}")
-        lines.append(f"- vs {name} ({symbol}): " + ", ".join(cells))
+        # The table shows the index's close date and not the stock's, so the end is given
+        # whichever of the two series stops first.
+        end = _shared_end(own, closes) or _shared_end(closes, own)
+        to = f" (to {end:%d %b}, the last close both have)" if end else ""
+        lines.append(f"- vs {name} ({symbol}): " + ", ".join(cells) + to)
     if sector is not None:
         lines.append(f"  The sector index is the closest NIFTY index to Yahoo's present-day classification of "
                      f"{canonical}, not NSE's index membership.")
     return lines
+
+
+def _shared_end(closes: pd.Series, other: pd.Series) -> date | None:
+    """The last date both series have, when it falls before ``closes``' own last close; else None.
+
+    Relative returns stop there (``risk.relative_return``), so a reader must not take
+    them to run to the later close shown beside them.
+    """
+    shared = risk.shared_closes(closes, other).index
+    return shared[-1] if len(shared) and shared[-1] < closes.index[-1] else None
+
+
+def _did_you_mean(symbol: str) -> str:
+    """'; did you mean USDINR=X?' for a pair written with a slash, such as USD/INR; else ''."""
+    if not isinstance(symbol, str) or "/" not in symbol:
+        return ""
+    joined = symbol.replace("/", "")
+    suggestion = normalize_symbol(joined)
+    return f"; did you mean {suggestion}?" if suggestion != joined.upper() else ""

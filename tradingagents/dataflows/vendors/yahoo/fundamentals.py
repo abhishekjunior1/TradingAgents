@@ -1,5 +1,7 @@
+import functools
 import logging
 import re
+from itertools import pairwise
 from typing import Annotated
 
 import pandas as pd
@@ -11,7 +13,7 @@ from tradingagents.dataflows.date_window import (
     withhold_undated_statements,
     withhold_undisclosed_trades,
 )
-from tradingagents.dataflows.errors import VendorUnavailableError
+from tradingagents.dataflows.errors import NoMarketDataError, VendorError, VendorUnavailableError
 from tradingagents.dataflows.net import vendor_reachable
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import (
@@ -20,7 +22,7 @@ from tradingagents.dataflows.vendors.yahoo.common import (
     raise_for_empty,
     yf_retry,
 )
-from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
+from tradingagents.dataflows.vendors.yahoo.ohlcv import HISTORY_BEFORE_AS_OF_DAYS, load_ohlcv
 from tradingagents.markets.exchanges import exchange_for_symbol
 
 logger = logging.getLogger(__name__)
@@ -114,17 +116,93 @@ def get_fundamentals(
 
 
 def _statement(ticker, freq, as_of_date, title, quarterly_attr, annual_attr) -> str:
-    """One financial statement as CSV, for a run dated today."""
+    """One financial statement as CSV, for a run dated today, headed by its source and currency."""
     canonical = normalize_symbol(ticker)
     withheld = withhold_undated_statements(as_of_date, canonical, title)
     if withheld:
         return withheld
     what = title.lower()
-    attr = quarterly_attr if freq.lower() == "quarterly" else annual_attr
+    quarterly = freq.lower() == "quarterly"
+    attr = quarterly_attr if quarterly else annual_attr
     data = yf_retry(lambda: getattr(yf.Ticker(canonical), attr))
     if data is None or data.empty:
         raise_for_empty(ticker, canonical, f"{what} data")
-    return f"# {title} data for {canonical} ({freq})\n" + data.to_csv()
+    notes = _statement_currency(canonical) + (_quarter_gaps(data.columns) if quarterly else [])
+    return f"# {title} data for {canonical} ({freq})\n" + "".join(f"# {note}\n" for note in notes) + data.to_csv()
+
+
+def _statement_currency(canonical: str) -> list[str]:
+    """Header lines naming a statement's source, currency and unit.
+
+    Yahoo gives statements in the currency the company reports in, which need not
+    be the one its listing quotes in: INFY.NS quotes in INR and reports in USD, so
+    its Diluted EPS of 0.80 is dollars. The profile states both (as in
+    ``get_fundamentals``); without it the currency is said to be unknown, never
+    guessed from the quote, and the statement is still served.
+    """
+    failed = False
+    try:
+        reported, quote = _currencies(canonical, get_current_date())
+    except VendorError as exc:
+        logger.debug("No profile to read %s's reporting currency from: %s", canonical, exc)
+        reported = quote = None
+        failed = not isinstance(exc, NoMarketDataError)     # a rate limit or an outage, not Yahoo's answer
+    exchange = exchange_for_symbol(canonical)
+    quote = quote or (exchange.currency if exchange else None)
+    unit = "full units (not thousands, millions or crores), except per-share figures such as EPS"
+    if not reported:
+        lines = [f"Source: Yahoo Finance. The currency of these money amounts, which are in {unit}, could not be "
+                 f"retrieved: Yahoo's company profile did not load." if failed else
+                 f"Source: Yahoo Finance. Yahoo does not state the currency of these money amounts, "
+                 f"which are in {unit}."]
+        if quote:
+            lines.append(f"Note: do not assume {quote}, the currency {canonical} quotes in; "
+                         f"a company can report in another currency.")
+        return lines
+    lines = [f"Source: Yahoo Finance. Money amounts are in {reported}, the currency the company reports in, "
+             f"as {unit}."]
+    if quote and quote != reported:
+        lines.append(f"Note: {canonical} quotes in {quote}, so convert these {reported} amounts, per-share ones "
+                     f"included, before comparing them with its {quote} prices or other {quote} figures.")
+    return lines
+
+
+@functools.lru_cache(maxsize=256)
+def _currencies(canonical: str, day: str) -> tuple[str | None, str | None]:
+    """The reporting and quote currencies in ``canonical``'s Yahoo profile, read once a ``day``.
+
+    A profile costs three Yahoo requests, which each of a listing's statements would
+    otherwise repeat; ``day`` keys the cache, so a new day reads it afresh. A failed
+    read raises, so it is not kept and the next statement asks again. It is not
+    retried either: a header line must not hold up a statement that has arrived.
+    """
+    info = yf_retry(lambda: yf.Ticker(canonical).info, max_retries=0)
+    if not isinstance(info, dict):
+        raise NoMarketDataError(canonical, canonical, "no company profile")
+    return info.get("financialCurrency"), info.get("currency")
+
+
+def _months_text(days: int) -> str:
+    """A gap of ``days`` in whole months, or in days when it is under two months."""
+    months = round(days / 30.44)
+    return f"{months} months" if months > 1 else f"{days} days"
+
+
+def _quarter_gaps(columns) -> list[str]:
+    """A note when a quarterly statement's columns are not consecutive quarters, else nothing.
+
+    Indian companies publish a balance sheet only with half-year and annual results
+    (SEBI LODR), and Yahoo's quarterly data can skip a quarter, so neighbouring
+    columns can be six months apart. Quarters of 13 or 14 weeks (52/53-week years)
+    round to three months and are not flagged.
+    """
+    ends = pd.DatetimeIndex(pd.to_datetime(pd.Index(columns), errors="coerce")).dropna().unique().sort_values()
+    gaps = [(a, b) for a, b in pairwise(ends) if round((b - a).days / 30.44) != 3]
+    if not gaps:
+        return []
+    shown = ", ".join(f"{a:%Y-%m-%d} to {b:%Y-%m-%d} ({_months_text((b - a).days)})" for a, b in gaps)
+    return [f"Note: these quarterly columns are not consecutive quarters: {shown}. A change across such a gap "
+            f'is not a quarter-on-quarter change; annual statements (freq="annual") cover each full year.']
 
 
 def get_balance_sheet(
@@ -180,12 +258,16 @@ _PRICE_IN_TEXT = re.compile(r"at price ([\d,]*\.?\d+) per share", re.IGNORECASE)
 
 
 def _insider_price_note(canonical: str, data: pd.DataFrame, as_of_date: str | None) -> str:
-    """A note when an NSE/BSE listing's insider prices do not fit its own closes, else "".
+    """A note when an NSE/BSE listing's insider prices do not fit its closes or cannot be checked, else "".
 
     Yahoo gives no currency for these rows, and for Indian listings their
     per-share prices have been far below the stock's INR closes. The prices are
     read from the Text column ("Sale at price 15.69 per share.") and the median
     is held to half the lowest and twice the highest close over the same dates.
+    Yahoo has no daily history for some BSE listings (RELIANCE.BO), which are
+    held to the NSE listing under the same symbol instead; rows with no closes
+    to check them against still carry the currency caveat, which tells closes
+    Yahoo does not have from closes that could not be retrieved.
     """
     exchange = exchange_for_symbol(canonical)
     if exchange is None or not {"Text", "Start Date"} <= set(data.columns):
@@ -201,28 +283,74 @@ def _insider_price_note(canonical: str, data: pd.DataFrame, as_of_date: str | No
     rows = rows[rows["price"] > 0]
     if rows.empty:
         return ""
-    try:
-        bars = load_ohlcv(canonical, as_of_date or get_current_date(), fill_gaps=False)
-    except Exception as exc:  # the note is optional: without closes the rows stand as Yahoo gave them
-        logger.debug("No closes to check %s insider prices against: %s", canonical, exc)
-        return ""
-    # A trade dated on a holiday is read against the sessions just before it.
-    span = (bars["Date"] >= rows["date"].min() - pd.Timedelta(days=7)) & (bars["Date"] <= rows["date"].max())
-    closes = bars.loc[span, "Close"].dropna()
-    if closes.empty:
-        return ""
+    currency = exchange.currency
+    sources = [canonical] + ([canonical[:-3] + ".NS"] if canonical.upper().endswith(".BO") else [])
+    found = {}
+    for source in sources:
+        closes = found[source] = _closes_over(source, rows["date"], as_of_date)
+        if closes is not None and not closes.empty:
+            break
+    else:
+        listings = " or ".join(sources)
+        # A request that failed says nothing about whether there were closes.
+        if any(read is None for read in found.values()):
+            unchecked = f"no {currency} closes of {listings} over the same period could be retrieved"
+        else:
+            unchecked = f"there were no {currency} closes of {listings} over the same period"
+        return (
+            f"\nNote: Yahoo does not state the currency of these prices and values, and {unchecked} to "
+            f"check them against, so do not assume they are rupee amounts. Indian insider trades are "
+            f"disclosed on NSE/BSE under SEBI's insider-trading (PIT) regulations.\n"
+        )
     low, high = closes.min(), closes.max()
     if 0.5 * low <= rows["price"].median() <= 2 * high:
         return ""
-    currency = exchange.currency
+    if source == canonical:
+        whose, missing = f"{canonical}'s {currency} closes", ""
+    else:
+        whose = f"the {currency} closes of {source}, the NSE listing under the same symbol,"
+        missing = (f"; Yahoo has none for {canonical} then" if found[canonical] is not None
+                   else f"; those of {canonical} could not be retrieved")
     return (
         f"\nNote: Yahoo does not state the currency of these prices and values. Their per-share "
         f"prices ({price_text(rows['price'].min())}-{price_text(rows['price'].max())}) do not match "
-        f"{canonical}'s {currency} closes over the same period ({price_text(low)}-{price_text(high)}), so "
+        f"{whose} over the same period ({price_text(low)}-{price_text(high)}{missing}), so "
         f"they are not rupee amounts and must not be compared with {currency} prices or read as "
         f"rupee values. Indian insider trades are disclosed on NSE/BSE under SEBI's insider-trading "
         f"(PIT) regulations.\n"
     )
+
+
+def _closes_over(symbol: str, dates: pd.Series, as_of_date: str | None) -> pd.Series | None:
+    """``symbol``'s closes from a week before the first of ``dates`` to the last: empty when
+    Yahoo has none then, None when they could not be retrieved.
+
+    Only closes from the trades' span are kept, so no staleness test applies: a history
+    that stops or pauses before the last trade, as a suspended listing's does, still gives
+    the closes it has then. They are read as of the last of ``dates``, or of the first date
+    the shared 5-year download serves when that is later and the download holds the whole
+    span, and never after the run date.
+    """
+    # A trade dated on a holiday is read against the sessions just before it.
+    start = dates.min() - pd.Timedelta(days=7)
+    run = pd.Timestamp(as_of_date or get_current_date())
+    until = min(run, dates.max())
+    # load_ohlcv reads a date from the shared 5-year download only when the year of history
+    # before it lies within that download (which opens at this time of day, five years back);
+    # an earlier date gets a download of its own.
+    window = pd.Timestamp.today().normalize() - pd.DateOffset(years=5)
+    if start >= window:
+        until = min(run, max(until, window + pd.Timedelta(days=HISTORY_BEFORE_AS_OF_DAYS + 1)))
+    try:
+        bars = load_ohlcv(symbol, f"{until:%Y-%m-%d}", fill_gaps=False, max_stale_days=None)
+    except NoMarketDataError as exc:
+        logger.debug("No closes of %s to check insider prices against: %s", symbol, exc)
+        return pd.Series(dtype=float)
+    except Exception as exc:  # without closes the rows cannot be checked, which the note then says
+        logger.debug("Could not retrieve closes of %s to check insider prices against: %s", symbol, exc)
+        return None
+    span = (bars["Date"] >= start) & (bars["Date"] <= dates.max())
+    return bars.loc[span, "Close"].dropna()
 
 
 def get_company_profile(ticker: str) -> dict:

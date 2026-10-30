@@ -26,7 +26,7 @@ import os
 import re
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import UTC, date, datetime, time
 
 import pandas as pd
 from dateutil import parser as date_parser
@@ -459,15 +459,22 @@ _AMBIGUOUS_DATE = re.compile(r"(?<!\d)(\d{1,2})([/.\- ])(\d{1,2})\2\d{2,4}(?!\d)
 # An offset after GMT or UTC ("GMT-4", "UTC+5:30", "GMT-0400"). pandas and dateutil read
 # a short one the POSIX way round, GMT-4 as four hours ahead of UTC; a page means behind.
 _GMT_OFFSET = re.compile(r"(?<![A-Za-z])(?:GMT|UTC)\s*([+-])(\d{1,2})(?::?(\d{2}))?(?!\d)")
-_PARSE_DEFAULTS = (datetime(2001, 1, 1), datetime(2002, 2, 2))
+_PARSE_DEFAULTS = (datetime(2001, 1, 1, 0), datetime(2002, 2, 2, 1))
+# The years a page's date is read in. Outside them it stands for no date (Go's and
+# .NET's zero time 0001-01-01, which Hugo writes for an undated page, or 9999-12-31),
+# and moving it to a listing's zone overflows or lands in local mean time.
+_YEARS = (1900, 2200)
 
 
 def _iso_offset(match: re.Match) -> str:
     return f"{match[1]}{int(match[2]):02d}:{match[3] or '00'}"
 
 
-def published_date(value) -> datetime | None:
-    """The date an item states, in UTC, or None when it is missing, unreadable or not a full date.
+def published_date(value) -> date | None:
+    """The date an item states: a UTC datetime when it gives a time of day and a zone,
+    a naive datetime (the page's wall time) when it gives a time but no zone, a date
+    when it gives no time or exactly midnight, or None when it is missing, unreadable,
+    not a full date or a placeholder for none (a year outside ``_YEARS``).
 
     The text comes from Exa, Jina or the page itself. A date without a day or a
     year ("2026", "March 2026", "10:30") would read as the 1st or as today, a
@@ -475,6 +482,10 @@ def published_date(value) -> datetime | None:
     such as 05/03/2026 is May or March depending on the site: any of them could
     let a later item into a past window, so they count as undated. An offset
     after GMT or UTC is read as hours from UTC (GMT-4 is four hours behind it).
+    A date alone (YouTube's upload date) is no instant: read as midnight UTC it
+    would fall on the evening before in New York. Nor is exactly midnight, which is
+    how Exa writes a page that states only a date (an RBI press release and a
+    Livemint page on 2026-10-29). A time with no zone is placed by ``local_day``.
     """
     if not isinstance(value, str) or not value.strip() or len(value) > 100:
         return None
@@ -488,22 +499,22 @@ def published_date(value) -> datetime | None:
     # does not know), and pandas guesses no format (it warns of a day-first one).
     try:
         # Parsed with two different defaults: a part the text lacks shows up as a
-        # difference between the two. Only the dates are compared.
+        # difference between the two, in the date (not a full date) or the hour (no time).
         first = date_parser.parse(value, default=_PARSE_DEFAULTS[0], ignoretz=True)
         second = date_parser.parse(value, default=_PARSE_DEFAULTS[1], ignoretz=True)
     except (ValueError, OverflowError):
         return None
-    if first.date() != second.date():
+    if first.date() != second.date() or not _YEARS[0] <= first.year <= _YEARS[1]:
         return None
-    stamp = pd.to_datetime(value, utc=True, errors="coerce", format="mixed")
+    # In the text's own zone, None when it gives none (not read as UTC).
+    stamp = pd.to_datetime(value, errors="coerce", format="mixed")
     if pd.isna(stamp):
         return None
-    try:
+    if first.hour != second.hour or first.time() == time():   # no time given, or exactly midnight
+        return first.date()
+    if stamp.tzinfo is None:
         return stamp.to_pydatetime()
-    except (ValueError, OverflowError):
-        # A calendar-edge date with an offset ("0001-01-01T00:00:00+05:30", an unset
-        # date some servers write) falls outside the years a datetime holds.
-        return None
+    return stamp.tz_convert(UTC).to_pydatetime()
 
 
 def cutoff(day: str | None, symbol: str | None = None) -> tuple[str, datetime, bool]:
@@ -519,9 +530,28 @@ def cutoff(day: str | None, symbol: str | None = None) -> tuple[str, datetime, b
     return run_day, datetime.strptime(run_day if past else today, "%Y-%m-%d"), past
 
 
-def in_dates(published: datetime | None, start: datetime, end: datetime, past: bool) -> bool:
+def in_dates(published: date | None, start: datetime, end: datetime, past: bool, zone=None) -> bool:
     """Whether an item belongs in ``[start, end]``: a dated one when it falls inside,
-    an undated one only in a current run (a past run cannot show it is not from later)."""
+    ``zone``'s days (``date_window.window_zone``), a date alone by its date and a time
+    with no zone by ``local_day``, and an undated one only in a current run (a past
+    run cannot show it is not from later)."""
     if published is None:
         return not past
-    return date_window.in_window(published, start, end)
+    if isinstance(published, datetime) and published.tzinfo is not None:
+        return date_window.in_window(published, start, end, zone)
+    return start.date() <= local_day(published, zone) <= end.date()
+
+
+def local_day(published: date, zone=None) -> date:
+    """The day ``published`` falls on in ``zone`` (else UTC), as ``in_dates`` counts it.
+
+    A time with no zone could be any zone's: it counts on the later of the day it
+    states and its day in ``zone`` read as UTC, so a past run reads it early on
+    neither reading (10 May 01:00 stays the 10th in New York, and 9 May 22:00 is
+    the 10th in India if it was UTC).
+    """
+    if not isinstance(published, datetime):
+        return published
+    if published.tzinfo is None:
+        return max(published.date(), published.replace(tzinfo=UTC).astimezone(zone or UTC).date())
+    return published.astimezone(zone or UTC).date()

@@ -1,5 +1,7 @@
 """Tests for TradingMemoryLog — storage, deferred reflection, PM injection, legacy removal."""
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -134,6 +136,62 @@ class TestTradingMemoryLogCore:
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
         assert len(log.load_entries()) == 1
+
+    def test_a_swing_rating_and_an_intraday_plan_on_one_day_are_both_kept(self, tmp_path):
+        """One decision per ticker, date and horizon. The guard ignored the horizon, so an
+        intraday plan made after a swing rating of the same stock that day was dropped
+        without a word and never scored."""
+        log = make_log(tmp_path)
+        assert log.store_decision("NVDA", "2026-01-10", DECISION_BUY) is True
+        assert log.store_decision("NVDA", "2026-01-10", DECISION_BUY, intraday_plan={"direction": "long"}) is True
+        assert log.store_decision("NVDA", "2026-01-10", DECISION_BUY) is False
+        assert log.store_decision("NVDA", "2026-01-10", DECISION_BUY, intraday_plan={}) is False
+        assert [entry.get("horizon") for entry in log.load_entries()] == [None, "intraday"]
+
+    @pytest.mark.parametrize("intraday_first", [True, False])
+    def test_each_horizon_settles_its_own_entry(self, tmp_path, intraday_first):
+        # Each update runs while the other horizon's entry is still pending and stored ahead of its own.
+        log = make_log(tmp_path)
+        store_swing = lambda: log.store_decision("NVDA", "2026-01-10", DECISION_BUY)  # noqa: E731
+        store_intraday = lambda: log.store_decision("NVDA", "2026-01-10", DECISION_BUY,  # noqa: E731
+                                                    intraday_plan={"direction": "long"})
+        settle_swing = lambda: log.update_with_outcome("NVDA", "2026-01-10", 0.05, 0.02, 5,  # noqa: E731
+                                                       "swing lesson", "2026-01-17")
+        settle_intraday = lambda: log.update_with_intraday_outcome(  # noqa: E731
+            "NVDA", "2026-01-10", {"net_return_pct": 0.4}, "intraday lesson", "2026-01-12")
+        if intraday_first:
+            store_intraday(), store_swing()
+            assert settle_swing() and settle_intraday()
+        else:
+            store_swing(), store_intraday()
+            assert settle_intraday() and settle_swing()
+
+        entries = {entry.get("horizon", "swing"): entry for entry in log.load_entries()}
+        intraday, swing = entries["intraday"], entries["swing"]
+        assert (intraday["reflection"], intraday["raw"]) == ("intraday lesson", "+0.4%")
+        assert (swing["reflection"], swing["raw"]) == ("swing lesson", "+5.0%")
+
+    def test_a_batch_of_swing_outcomes_leaves_an_intraday_entry_pending(self, tmp_path):
+        log = make_log(tmp_path)
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY, intraday_plan={"direction": "long"})
+        log.store_decision("NVDA", "2026-01-10", DECISION_BUY)
+        log.batch_update_with_outcomes([{"ticker": "NVDA", "trade_date": "2026-01-10", "raw_return": 0.05,
+                                         "alpha_return": 0.02, "holding_days": 5, "reflection": "swing lesson"}])
+        intraday, swing = log.load_entries()
+        assert intraday["pending"] and not swing["pending"]
+
+    def test_a_run_whose_decision_is_not_added_says_so(self, tmp_path, caplog):
+        graph = SimpleNamespace(memory_log=make_log(tmp_path), _log_state=lambda *args: None)
+        state = {"final_trade_decision": DECISION_BUY, "final_rating": "Buy"}
+        TradingAgentsGraph.record_decision(graph, "NVDA", "2026-01-10", state)
+        with caplog.at_level(logging.WARNING):
+            TradingAgentsGraph.record_decision(graph, "NVDA", "2026-01-10", state)
+        assert "already holds a swing decision for NVDA on 2026-01-10" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            TradingAgentsGraph.record_decision(graph, "NVDA", "2026-01-10",
+                                               {**state, "decision_horizon": "intraday", "intraday_plan": {}})
+        assert "already holds" not in caplog.text and len(graph.memory_log.load_entries()) == 2
 
     def test_store_decision_idempotent_after_the_entry_resolves(self, tmp_path):
         """A settled entry still blocks a duplicate.
