@@ -4,6 +4,7 @@
 
 <div align="center" style="line-height: 1;">
   <a href="https://arxiv.org/abs/2412.20138" target="_blank"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2412.20138-B31B1B?logo=arxiv"/></a>
+  <a href="docs/TradingAgents-India-Research-Paper.pdf"><img alt="Fork technical report (PDF)" src="https://img.shields.io/badge/Fork_technical_report-PDF-0B6E4F"/></a>
   <a href="https://discord.com/invite/hk9PGKShPK" target="_blank"><img alt="Discord" src="https://img.shields.io/badge/Discord-TradingResearch-7289da?logo=discord&logoColor=white&color=7289da"/></a>
   <a href="https://x.com/TauricResearch" target="_blank"><img alt="X Follow" src="https://img.shields.io/badge/X-TauricResearch-white?logo=x&logoColor=white"/></a>
   <a href="https://github.com/TauricResearch/" target="_blank"><img alt="Community" src="https://img.shields.io/badge/GitHub_Community-TauricResearch-14C290?logo=discourse"/></a>
@@ -29,7 +30,7 @@
 
 # TradingAgents: Multi-Agents LLM Financial Trading Framework
 
-> **This repository is an independent fork** of [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents), based on its v0.7.1 release, with the additions listed in [What this fork adds](#what-this-fork-adds). It is not an official Tauric Research release. The framework, the logo, badges and community links above, and the translations they offer (of the upstream README, without this fork's additions) are Tauric Research's; the [paper](https://arxiv.org/abs/2412.20138) is by Yijia Xiao, Edward Sun, Di Luo and Wei Wang.
+> **This repository is an independent fork** of [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents), based on its v0.7.1 release, with the additions listed in [What this fork adds](#what-this-fork-adds). It is not an official Tauric Research release. The framework, the logo, badges and community links above, and the translations they offer (of the upstream README, without this fork's additions) are Tauric Research's; the [paper](https://arxiv.org/abs/2412.20138) is by Yijia Xiao, Edward Sun, Di Luo and Wei Wang. This fork's own technical report, [Adapting Multi-Agent LLM Equity Research to Indian Markets](docs/TradingAgents-India-Research-Paper.pdf) (30 October 2026, not peer reviewed), describes its additions, how they were checked and a live paper-trading case study.
 
 ## What this fork adds
 
@@ -53,6 +54,7 @@ Like the original, this fork is for research and paper trading only: it places n
 ## News
 
 <!-- news:start -->
+- [2026-10] **This fork's technical report** ([PDF](docs/TradingAgents-India-Research-Paper.pdf)): the Indian-market adaptation, data-integrity and look-ahead safeguards, intraday planning and scoring, the multi-agent review that checked the code, a live paper-trading case study, and what a commercial launch in India would require. Not peer reviewed; not investment advice.
 - [2026-10] **This fork** adds Indian markets (NSE/BSE), intraday day-trader paper plans with a `/day-trader` skill for Claude Code, a `claude_code` provider for Claude Pro or Max plans, and optional Agent-Reach web research and AlphArena paper trading, on top of v0.7.1; see [What this fork adds](#what-this-fork-adds).
 - [2026-10] **TradingAgents v0.7.1** released with decisions scored only on final closes and settled across long market holidays, a fix for model dates that could read filings made after the run date, and fixes to portfolios, prices, SEC statements and reports.
 - [2026-10] **TradingAgents v0.7.0** released with runs on your own ChatGPT Plus or Pro plan, backtests scored from the first close after each decision, a note at start-up when a newer release is out, and a wheel attached to each GitHub release.
