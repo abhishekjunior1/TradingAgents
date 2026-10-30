@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated
 
 import pandas as pd
@@ -11,8 +11,83 @@ from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import price_text, raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
+from tradingagents.markets.exchanges import (
+    exchange_for_symbol,
+    holiday_name,
+    is_trading_day,
+    session_status,
+)
 
 logger = logging.getLogger(__name__)
+
+# Sessions of history each indicator needs before its value means anything (stockstats'
+# default windows). With fewer, stockstats still returns a number: an RSI of 50 from one bar.
+_MIN_SESSIONS = {
+    "close_10_ema": 10, "close_50_sma": 50, "close_200_sma": 200,
+    "macd": 26, "macds": 34, "macdh": 34, "rsi": 15,
+    "boll": 20, "boll_ub": 20, "boll_lb": 20, "atr": 15, "vwma": 14, "mfi": 15,
+}
+_TRADING = ("pre-open", "open", "closing")
+
+
+def _session_now(canonical: str):
+    """The listing's exchange and where its trading day stands now; (None, None) for a
+    listing without an exchange calendar here (only NSE and BSE have one)."""
+    exchange = exchange_for_symbol(canonical)
+    return (exchange, session_status(exchange)) if exchange is not None else (None, None)
+
+
+def _forming(status, day: date) -> bool:
+    """Whether ``day``'s bar is a session still trading: its Close is the latest price, not a close."""
+    return status is not None and status.state in _TRADING and day == status.local_time.date()
+
+
+def _short_history(indicator: str, rows: int) -> str | None:
+    """Why ``indicator`` has no value from ``rows`` sessions of data, or None when they are enough."""
+    need = _MIN_SESSIONS.get(indicator, 1)
+    if rows >= need:
+        return None
+    return f"N/A: not enough price history ({indicator} needs {need} sessions; the data has {rows} through this date)"
+
+
+def _no_value(day: date, exchange, status) -> str:
+    """Why ``day`` has no row: not a trading day, today's bar not out yet, or a gap in the vendor's data."""
+    if exchange is None:
+        return ("N/A: Not a trading day (weekend)" if day.weekday() >= 5
+                else "N/A: no data for this date (a market holiday or a gap in the vendor's data)")
+    if day.year not in exchange.holiday_years and day.weekday() < 5 and day not in exchange.special_sessions:
+        return (f"N/A: no data for this date (a holiday or a gap in the vendor's data; the {exchange.code} "
+                f"holiday list here does not cover {day.year})")
+    if not is_trading_day(exchange, day):
+        return f"N/A: Not a trading day ({holiday_name(exchange, day) or 'weekend'})"
+    if day >= status.local_time.date():
+        return f"N/A: no bar yet for today's {exchange.code} session"
+    return f"N/A: no price data from the vendor for this {exchange.code} trading day"
+
+
+def _range_notes(canonical: str, days: set[date], start_date: str, end_date: str) -> list[str]:
+    """Notes on an NSE/BSE listing's daily rows: a row of a session still trading, and
+    trading days the vendor returned no row for."""
+    exchange, status = _session_now(canonical)
+    if exchange is None or not days:
+        return []
+    notes = []
+    newest = max(days)
+    if _forming(status, newest):
+        notes.append(f"the {newest:%Y-%m-%d} row is {exchange.code}'s session still trading at "
+                     f"{status.local_time:%H:%M} {exchange.tz_label}: its Close is the latest price, not a close "
+                     f"(final after {exchange.close_final:%H:%M} {exchange.tz_label})")
+    first = date.fromisoformat(start_date)
+    last = min(date.fromisoformat(end_date), status.last_complete_session)
+    expected = [day for day in (first + timedelta(days=n) for n in range((last - first).days + 1))
+                if day.year in exchange.holiday_years and is_trading_day(exchange, day)]
+    missing = [day for day in expected if day not in days]
+    if missing:
+        shown = ", ".join(f"{day:%d %b %Y}" for day in missing[:5]) + (", ..." if len(missing) > 5 else "")
+        notes.append(f"no row for {len(missing)} of the {len(expected)} {exchange.code} trading days in this range "
+                     f"({shown}): they are missing from Yahoo's data for this listing (or it had not listed yet), "
+                     f"not holidays")
+    return notes
 
 
 def get_YFin_data_online(
@@ -58,9 +133,11 @@ def get_YFin_data_online(
     # instrument was priced.
     label = canonical if canonical == symbol.upper() else f"{canonical} (from {symbol})"
     header = f"# Stock data for {label} from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(data)}\n\n"
+    header += f"# Total records: {len(data)}\n"
+    days = {pd.Timestamp(stamp).date() for stamp in data.index}
+    header += "".join(f"# Note: {note}\n" for note in _range_notes(canonical, days, start_date, end_date))
 
-    return header + csv_string
+    return header + "\n" + csv_string
 
 
 def get_stock_stats_indicators_window(
@@ -157,6 +234,7 @@ def get_stock_stats_indicators_window(
     # Optimized: Get stock data once and calculate indicators for all dates
     try:
         indicator_data = _get_stock_stats_bulk(symbol, indicator, as_of_date)
+        exchange, status = _session_now(normalize_symbol(symbol))
 
         # Generate the date range we need
         current_dt = as_of_dt
@@ -168,8 +246,11 @@ def get_stock_stats_indicators_window(
             # Look up the indicator value for this date
             if date_str in indicator_data:
                 indicator_value = indicator_data[date_str]
+                if _forming(status, current_dt.date()) and not indicator_value.startswith("N/A"):
+                    indicator_value += (f" (provisional: {exchange.code} is still trading at "
+                                        f"{status.local_time:%H:%M} {exchange.tz_label}; today's bar is not a close)")
             else:
-                indicator_value = "N/A: Not a trading day (weekend or holiday)"
+                indicator_value = _no_value(current_dt.date(), exchange, status)
 
             date_values.append((date_str, indicator_value))
             current_dt = current_dt - relativedelta(days=1)
@@ -215,17 +296,20 @@ def _get_stock_stats_bulk(
     from stockstats import wrap
 
     data = load_ohlcv(symbol, as_of_date)
-    df = wrap(data)
+    df = wrap(data.sort_values("Date"))
     df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
 
     df[indicator]  # This triggers stockstats to calculate the indicator
 
     result_dict = {}
-    for _, row in df.iterrows():
+    for rows, (_, row) in enumerate(df.iterrows(), start=1):
         date_str = row["Date"]
         indicator_value = row[indicator]
 
-        if pd.isna(indicator_value):
+        short = _short_history(indicator, rows)
+        if short:
+            result_dict[date_str] = short
+        elif pd.isna(indicator_value):
             result_dict[date_str] = "N/A"
         else:
             result_dict[date_str] = str(indicator_value)
@@ -288,7 +372,7 @@ def get_stock_stats(
     matching_rows = df[df["Date"].str.startswith(as_of_str)]
 
     if not matching_rows.empty:
-        indicator_value = matching_rows[indicator].values[0]
-        return indicator_value
-    else:
-        return "N/A: Not a trading day (weekend or holiday)"
+        short = _short_history(indicator, int((df["Date"] <= as_of_str).sum()))
+        return short if short else matching_rows[indicator].values[0]
+    exchange, status = _session_now(normalize_symbol(symbol))
+    return _no_value(pd.to_datetime(as_of_date).date(), exchange, status)

@@ -284,7 +284,7 @@ def test_a_previous_close_of_zero_does_not_cost_the_snapshot(yahoo):
     yahoo.frame = pd.concat([_session("2026-10-27"), wednesday, _session("2026-10-29", end="10:10")])
     text = yahoo_intraday.get_intraday_bars("RELIANCE.NS", "2026-10-29")     # was a division by zero
     assert text.startswith("# Intraday snapshot for RELIANCE.NS")
-    assert "| Gap at the open vs the previous close |" in text
+    assert "| Gap at the first bar's open vs the previous close |" in text
 
 
 @pytest.mark.unit

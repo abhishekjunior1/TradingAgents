@@ -119,7 +119,9 @@ intraday paper plan for <day> (<why>); exit by 15:10 IST".
 - the session the plan is for, why, and the exit-by (square-off) time;
 - the last complete session: open, high, low, close;
 - the plan's session so far, once it has traded: open, high, low, last, VWAP
-  (typical price), volume, the gap from the previous close, the 15- and
+  (typical price), volume, the gap from the previous close (at the first
+  bar's open, and at the opening price the daily bar carries, which NSE and
+  BSE set in the pre-open auction before the first bar), the 15- and
   30-minute opening ranges, relative volume (volume so far against the average
   of the earlier sessions in the bars by the same time of day, leaving out a
   special session on other hours, such as Muhurat trading), and last versus

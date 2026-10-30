@@ -14,7 +14,7 @@
 </div>
 <br>
 <div align="center">
-  <!-- Keep these links. Translations will automatically update with the README. -->
+  <!-- These translate the upstream TauricResearch/TradingAgents README, not this fork's. -->
   <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=de">Deutsch</a> | 
   <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=es">Español</a> | 
   <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=fr">français</a> | 
@@ -29,9 +29,31 @@
 
 # TradingAgents: Multi-Agents LLM Financial Trading Framework
 
+> **This repository is an independent fork** of [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents), based on its v0.7.1 release, with the additions listed in [What this fork adds](#what-this-fork-adds). It is not an official Tauric Research release. The framework, the logo, badges and community links above, and the translations they offer (of the upstream README, without this fork's additions) are Tauric Research's; the [paper](https://arxiv.org/abs/2412.20138) is by Yijia Xiao, Edward Sun, Di Luo and Wei Wang.
+
+## What this fork adds
+
+- **Indian markets (NSE/BSE).** Tickers as brokers write them (`NSE:RELIANCE`, `RELIANCE-EQ`) and index names (`NIFTY 50`, `SENSEX`); IST sessions with the 2026 NSE/BSE holidays; market context (NIFTY 50, SENSEX, India VIX, the closest NIFTY sector index, USD/INR, Brent); INR portfolios with configurable charges and capital-gains tax; and the `market` command with watchlists. [More](#indian-markets-nse--bse) · [docs/india.md](docs/india.md)
+- **Intraday (day-trader) plans.** `--horizon intraday` adds a Day Trader analyst that reads 5-minute bars, and the Trader and Portfolio Manager write a paper plan for one session (direction, entry, stop, target, exit-by time, size), which a later run scores on that session's bars. [More](#intraday-day-trader-plans) · [docs/intraday.md](docs/intraday.md)
+- **The `/day-trader` skill for Claude Code.** `/day-trader RELIANCE` (or `/day-trader TCS bse`) runs that analysis for one NSE or BSE stock and summarises the plan from the saved report. [More](docs/intraday.md#the-day-trader-skill-claude-code)
+- **Scenarios in every decision.** For any market, the Portfolio Manager's decision also gives bull, base and bear cases, key risks and a confidence level.
+- **Risk figures for your portfolio.** With `--portfolio`, in any market, the trader, risk analysts and Portfolio Manager also get each holding's volatility, drawdown, beta and return, the book's concentration and sector exposure, and a sizing reference. [More](#current-holdings)
+- **Your Claude plan.** The `claude_code` provider runs the agents' model calls on your Claude Pro or Max plan through your own Claude Code sign-in; a model tier set to another provider, and Jev screening with `TYPESAFE_API_KEY`, keep their own keys. [More](#required-apis)
+- **Web research through Agent-Reach (optional).** Web search, web pages and YouTube coverage as news sources, with no account or key. [More](#web-research-through-agent-reach-optional) · [docs/agent-reach.md](docs/agent-reach.md)
+- **Paper trading on AlphArena (optional).** A swing decision on a US stock or ETF can be sent to AlphArena as a paper trade with simulated money, after you confirm it or pass `--arena-yes`. [More](#paper-trading-on-alpharena-optional) · [docs/arena.md](docs/arena.md)
+
+```bash
+tradingagents --exchange nse --ticker RELIANCE --analysts market,news,fundamentals        # rate an NSE stock
+tradingagents --horizon intraday --exchange nse --ticker TCS --analysts market,news       # a paper plan for one session
+tradingagents market                                                                       # NSE session, indices, India VIX, USD/INR, Brent; no model called
+```
+
+Like the original, this fork is for research and paper trading only: it places no real orders, has no broker integration and reads no brokerage credentials, and its output is not investment advice, nor advice from a SEBI-registered research analyst or investment adviser. None of these additions was part of the paper's experiments (daily decisions on US technology stocks from January to March 2024), so its reported results say nothing about them, and the rest of the code has changed since those experiments too (see [Reproducibility](#reproducibility)). Every change is listed under "Unreleased" in [CHANGELOG.md](CHANGELOG.md).
+
 ## News
 
 <!-- news:start -->
+- [2026-10] **This fork** adds Indian markets (NSE/BSE), intraday day-trader paper plans with a `/day-trader` skill for Claude Code, a `claude_code` provider for Claude Pro or Max plans, and optional Agent-Reach web research and AlphArena paper trading, on top of v0.7.1; see [What this fork adds](#what-this-fork-adds).
 - [2026-10] **TradingAgents v0.7.1** released with decisions scored only on final closes and settled across long market holidays, a fix for model dates that could read filings made after the run date, and fixes to portfolios, prices, SEC statements and reports.
 - [2026-10] **TradingAgents v0.7.0** released with runs on your own ChatGPT Plus or Pro plan, backtests scored from the first close after each decision, a note at start-up when a newer release is out, and a wheel attached to each GitHub release.
 - [2026-10] **TradingAgents v0.6.0** released with reports saved as one HTML page, a provider per model tier so the managers and analysts can run on different models, past decisions settled for every ticker while the analysts work, and company news read from Yahoo search while Yahoo's news feed is down.
@@ -59,13 +81,11 @@ Full release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 <div align="center">
 
-🚀 [TradingAgents](#tradingagents-framework) | ⚡ [Installation & CLI](#installation-and-cli) | 🎬 [Demo](https://www.youtube.com/watch?v=90gr5lwjIho) | 📦 [Package Usage](#tradingagents-package) | 🤝 [Contributing](#contributing) | 📄 [Citation](#citation)
+✨ [What this fork adds](#what-this-fork-adds) | 🚀 [TradingAgents](#tradingagents-framework) | ⚡ [Installation & CLI](#installation-and-cli) | 🎬 [Demo](https://www.youtube.com/watch?v=90gr5lwjIho) | 📦 [Package Usage](#tradingagents-package) | 🤝 [Contributing](#contributing) | 📄 [Citation](#citation)
 
 </div>
 
-> 🎉 **TradingAgents** officially released! We have received numerous inquiries about the work, and we would like to express our thanks for the enthusiasm in our community.
->
-> So we decided to fully open-source the framework. Looking forward to building impactful projects with you!
+> 🎉 Tauric Research officially released **TradingAgents** and fully open-sourced the framework, thanking its community for the enthusiasm and inquiries about the work.
 
 ## TradingAgents Framework
 
@@ -74,17 +94,18 @@ TradingAgents is a multi-agent trading framework that mirrors the dynamics of re
 <p align="center">
   <img src="assets/schema.png" style="width: 100%; height: auto;">
 </p>
+<p align="center"><em>Figure 1 of the paper, with the data sources and the OpenAI o1 model its experiments used. This code has no Bloomberg, Reuters, X, EODHD or FinnHub feed, and its default models differ (see <a href="#required-apis">Required APIs</a>).</em></p>
 
 > TradingAgents framework is designed for research purposes. Trading performance may vary based on many factors, including the chosen backbone language models, model temperature, trading periods, the quality of data, and other non-deterministic factors. [It is not intended as financial, investment, or trading advice.](https://tauric.ai/disclaimer/)
 
-Our framework decomposes complex trading tasks into specialized roles.
+TradingAgents decomposes complex trading tasks into specialized roles.
 
 ### Analyst Team
 - Fundamentals Analyst: Evaluates company financials and performance metrics, identifying intrinsic values and potential red flags.
 - Sentiment Analyst: Aggregates news headlines, StockTwits, and Reddit chatter into a single sentiment read to gauge short-term market mood.
 - News Analyst: Monitors global news and macroeconomic indicators, interpreting the impact of events on market conditions.
 - Technical Analyst: Utilizes technical indicators (like MACD and RSI) to detect trading patterns and forecast price movements.
-- Day Trader: In intraday mode, reads 5-minute bars for one session's levels (opening range, VWAP, pivots, ATR) and paper position sizes, so the team can plan that session ([intraday plans](#intraday-day-trader-plans)).
+- Day Trader (added by this fork; intraday mode only): reads 5-minute bars for one session's levels (opening range, VWAP, pivots, ATR) and paper position sizes, so the team can plan that session ([intraday plans](#intraday-day-trader-plans)).
 
 The selected analysts work at the same time, each on its own tools, and the research debate starts once all of their reports are in.
 
@@ -108,7 +129,7 @@ The selected analysts work at the same time, each on its own tools, and the rese
 
 ### Risk Management and Portfolio Manager
 - Continuously evaluates portfolio risk by assessing market volatility, liquidity, and other risk factors. The risk management team evaluates and adjusts trading strategies, providing assessment reports to the Portfolio Manager for final decision.
-- The Portfolio Manager approves/rejects the transaction proposal. If approved, the order will be sent to the simulated exchange and executed.
+- The Portfolio Manager makes the final call: a rating from Buy to Sell with its thesis and, added by this fork, bull, base and bear cases, key risks and a confidence level; in intraday mode the decision also carries a paper plan for one session. In the paper's backtests the approved trade was executed in a simulation; this code sends nothing to a broker, and only a CLI run with [AlphArena](#paper-trading-on-alpharena-optional) switched on can send a swing decision on a US stock or ETF dated today in New York, as a paper trade, after you confirm it or pass `--arena-yes`.
 
 <p align="center">
   <img src="assets/risk.png" width="70%" style="display: inline-block; margin: 0 2%;">
@@ -118,9 +139,9 @@ The selected analysts work at the same time, each on its own tools, and the rese
 
 ### Installation
 
-Clone TradingAgents:
+Clone this fork (the upstream repository and Tauric Research's release downloads do not include its additions):
 ```bash
-git clone https://github.com/TauricResearch/TradingAgents.git
+git clone https://github.com/abhishekjunior1/TradingAgents.git
 cd TradingAgents
 ```
 
@@ -221,7 +242,9 @@ tradingagents --ticker NVDA --date 2026-09-23 --analysts market,news,fundamental
 ```
 Each flag skips only its own question. Run without a terminal, a missing answer stops the run before it starts and names the flag or variable to set.
 
-At start-up the interactive CLI mentions a newer release and notices from Tauric Research. It checks at most once a day, in the background, and sends nothing about your runs; set `TRADINGAGENTS_NO_UPDATE_CHECK=1` to turn it off. Runs without a terminal never check.
+To choose the data vendors for one run, pass `--vendor category=vendor` (repeatable; several vendors, comma-separated, make an ordered fallback), for example `--vendor news_data=yfinance,alpha_vantage`; an unknown category or vendor stops the run before it starts.
+
+At start-up the interactive CLI mentions a newer release and notices from Tauric Research. It checks at most once a day, in the background, and sends nothing about your runs; set `TRADINGAGENTS_NO_UPDATE_CHECK=1` to turn it off. Runs without a terminal never check. In this fork the notice still reports Tauric Research's releases, which do not include this fork's additions; the upgrade command it shows updates from the repository you installed from, so an upstream release arrives only once it has been merged into this fork.
 
 A saved report also includes `complete_report.html`, the report as one page with its sections listed beside the text, for reading in a browser, on a phone or in print. Answering the save question at the prompt also asks about the page and can open it in your browser; `--no-html` skips it, and so does `ta.save_reports(state, "NVDA", html=False)` from Python.
 
@@ -262,13 +285,13 @@ An interface will appear showing results as they load, letting you track the age
 
 ### Intraday (day-trader) plans
 
-`--horizon intraday` plans one trading session instead of rating a position over the holding period. The Day Trader joins the analysts, and the Trader and Portfolio Manager write a paper plan for the session: direction, entry, stop, target, exit-by time, size and what invalidates it. The date defaults to today (the listing's date when it is behind your machine's: New York's for a US ticker from India after midnight), and a past `--date` plans the session after it. A later run scores the plan on that session's 5-minute bars once its close is final, charges included. NSE/BSE plans exit by the broker square-off time (`TRADINGAGENTS_INTRADAY_SQUARE_OFF`, default 15:10 IST). Plans are paper only: nothing is sent to a broker.
+`--horizon intraday` (or `TRADINGAGENTS_DECISION_HORIZON=intraday` for every run, which backtests refuse; `--horizon swing` overrides it for one run) plans one trading session instead of rating a position over the holding period. The Day Trader joins the analysts, and the Trader and Portfolio Manager write a paper plan for the session: direction, entry, stop, target, exit-by time, size and what invalidates it. The date defaults to today (the listing's date when it is behind your machine's: New York's for a US ticker from India after midnight), and a past `--date` plans the session after it. A later run scores the plan on that session's 5-minute bars once its close is final, with charges counted on NSE/BSE plans (configurable: `TRADINGAGENTS_INTRADAY_COST_PROFILE`, `intraday_cost_overrides`). The memory log keeps one decision per ticker and date, whichever the horizon, so a plan made after a swing rating of the same ticker that day is not logged and never scored, and the run does not say so; a plan not settled while Yahoo still serves its session's 5-minute bars (about 60 days) is recorded as not scored. NSE/BSE plans exit by the broker square-off time (`TRADINGAGENTS_INTRADAY_SQUARE_OFF`, default 15:10 IST). Plans are paper only: nothing is sent to a broker.
 
 ```bash
-tradingagents --horizon intraday --exchange nse --ticker RELIANCE --analysts market,news
+tradingagents --horizon intraday --exchange nse --ticker TCS --analysts market,news
 ```
 
-In Claude Code, opened in this folder, the `/day-trader` skill runs the same headless analysis for one NSE or BSE stock and summarises the plan from the saved report: `/day-trader RELIANCE`, or `/day-trader TCS bse`. See [docs/intraday.md](docs/intraday.md) for the cut-off and session rules, broker square-off times, charges and leverage, Yahoo's intraday limits, and how plans are scored.
+In Claude Code, opened in this folder, the `/day-trader` skill runs the same headless analysis for one NSE or BSE stock and summarises the plan from the saved report: `/day-trader RELIANCE`, or `/day-trader TCS bse`. It runs without a terminal, so first set the provider, model, language and round variables from [CLI Usage](#cli-usage) and the provider's key in `.env`; set `TRADINGAGENTS_PYTHON` to this repository's Python if an older `tradingagents` is on your PATH. See [docs/intraday.md](docs/intraday.md) for the cut-off and session rules, broker square-off times, charges and leverage, Yahoo's intraday limits, and how plans are scored.
 
 ### Web research through Agent-Reach (optional)
 
@@ -282,12 +305,14 @@ tradingagents --ticker RELIANCE.NS --analysts market,news
 
 ### Paper trading on AlphArena (optional)
 
-[AlphArena](docs/arena.md) is a public arena where trading agents compete with simulated money on US stocks and ETFs. With `TRADINGAGENTS_ARENA=1` (or `--arena`) and your own `ALPHARENA_API_KEY`, the CLI shows a swing decision on a US stock or ETF, dated today in New York, as a paper trade after the run, and sends it only when you confirm (`--arena-yes` sends without asking). It checks before the run that the decision could be sent and that the key fits `TRADINGAGENTS_ARENA_MODE`. A US ticker's default date is the earlier of your machine's date and New York's, so from India after midnight it is New York's; on a machine whose date is behind New York's (California after 21:00), no run can be sent until the machine's midnight. Indian listings are never sent, since SEBI has cautioned against public paper-trading platforms built on Indian listed-stock prices, and neither are intraday plans or backtests. You register with AlphArena and accept its terms yourself; start with its sandbox key.
+[AlphArena](docs/arena.md) is a public arena where trading agents compete with simulated money on US stocks and ETFs. With `TRADINGAGENTS_ARENA=1` (or `--arena`) and your own `ALPHARENA_API_KEY`, the CLI shows a swing decision on a US stock or ETF, dated today in New York, as a paper trade after the run, and sends it only when you confirm (`--arena-yes` sends without asking). Before the analysis it says when the decision could not be sent, and the run goes on; when it could, a missing `ALPHARENA_API_KEY`, or one not for `TRADINGAGENTS_ARENA_MODE` (`sandbox`, the default, takes an `aa_test_` key; `live` an `aa_live_` key), stops the run with exit code 2. `--no-arena` turns the arena off for one run. A US ticker's default date is the earlier of your machine's date and New York's, so from India after midnight it is New York's; on a machine whose date is behind New York's (California after 21:00), no run can be sent until the machine's midnight. Indian listings are never sent, since SEBI has cautioned against public paper-trading platforms built on Indian listed-stock prices, and neither are intraday plans or backtests. You register with AlphArena and accept its terms yourself; start with its sandbox key.
 
 ```bash
 tradingagents --ticker AAPL --analysts market,news --arena
 tradingagents arena status                 # your agent's public profile and P&L (TRADINGAGENTS_ARENA_AGENT_ID)
 tradingagents arena leaderboard --period 7d
+tradingagents arena trades                 # your open paper trades (needs ALPHARENA_API_KEY)
+tradingagents arena close AAPL             # close your open AAPL paper trades, once you confirm
 ```
 
 See [docs/arena.md](docs/arena.md) for its risks, what is sent and what never is, and the ledger of every trade sent.
@@ -296,7 +321,7 @@ See [docs/arena.md](docs/arena.md) for its risks, what is sent and what never is
 
 ### Implementation Details
 
-We built TradingAgents with LangGraph to ensure flexibility and modularity. The framework supports multiple LLM providers: OpenAI, Google, Anthropic, xAI, DeepSeek, Qwen (Alibaba DashScope, international and China endpoints), GLM (Zhipu), MiniMax (global + China), OpenRouter, Ollama for local models, Azure OpenAI for enterprise, and your own ChatGPT plan.
+TradingAgents is built with LangGraph for flexibility and modularity. The framework supports multiple LLM providers: OpenAI, Google, Anthropic, xAI, DeepSeek, Qwen (Alibaba DashScope, international and China endpoints), GLM (Zhipu), MiniMax (global + China), OpenRouter, Ollama for local models, Azure OpenAI for enterprise and your own ChatGPT plan, and this fork adds your own Claude Pro or Max plan through Claude Code.
 
 ### Python Usage
 
@@ -342,6 +367,16 @@ config["deep_think_llm"] = "claude-opus-5-5"
 
 A tier on its own provider uses that provider's key and default endpoint; set `quick_think_backend_url` or `deep_think_backend_url` for a local or relay endpoint. The `TRADINGAGENTS_DEEP_THINK_PROVIDER` and `TRADINGAGENTS_QUICK_THINK_PROVIDER` variables set them for the CLI, together with the tier's model variable.
 
+For an NSE or BSE stock, pass its Yahoo ticker (`RELIANCE.NS`, `RELIANCE.BO`). Setting `decision_horizon` to `"intraday"` plans one session instead of rating a position ([intraday plans](#intraday-day-trader-plans)); Yahoo serves 5-minute bars for only about the last 60 days:
+
+```python
+config = DEFAULT_CONFIG.copy()
+config["decision_horizon"] = "intraday"
+ta = TradingAgentsGraph(["market", "news"], config=config)   # the Day Trader is added
+state, decision = ta.propagate("RELIANCE.NS", "2026-10-28")    # a past date plans the next session (29 Oct)
+print(state["intraday_plan"])                                  # the plan, as data
+```
+
 See `tradingagents/default_config.py` for all configuration options.
 
 ### Fundamentals as filed
@@ -379,13 +414,15 @@ The CLI takes the same content as a JSON file: `tradingagents --portfolio my_boo
 
 An empty `positions` list means a flat book, which is different from passing nothing. A run without a portfolio is never treated as flat.
 
+In this fork, a portfolio also brings the trader, the risk analysts and the Portfolio Manager risk figures computed before the run from Yahoo Finance daily prices up to the run date, in any market: each holding's value at its last close, 1-year volatility and maximum drawdown, beta and 1-year return against the run's benchmark, and unrealized P/L when an average price is given; the book's concentration and sector exposure; and a sizing reference for the analyzed ticker that risks `risk_per_trade_pct` of the book (default 1%) with a stop 2 x ATR(14) below the last close, capped at `max_position_pct` (default 20%; `TRADINGAGENTS_RISK_PER_TRADE_PCT`, `TRADINGAGENTS_MAX_POSITION_PCT`). Set `config["portfolio_risk"] = False` to give them the holdings alone. For NSE/BSE listings the figures also count trading charges and capital-gains tax ([docs/india.md](docs/india.md)).
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.
 
 ### Memory log
 
-The memory log is always on. Each completed run appends its decision to `~/.tradingagents/memory/trading_memory.md`. While the analysts of a later run work, TradingAgents settles every logged decision whose holding period has passed: it fetches the realised return (raw, and alpha against the instrument's regional benchmark) and generates a one-paragraph reflection. The Portfolio Manager then reads the most recent decisions for the same ticker plus recent lessons from other tickers, so each analysis carries forward what worked and what didn't. If settling fails, the run goes on and its report says so.
+The memory log is always on. Each completed run appends its decision to `~/.tradingagents/memory/trading_memory.md`, unless the log already holds one for that ticker and run date, swing or intraday: a second run on the same ticker and date, such as an intraday plan after a swing rating, is not logged, so it is never settled or scored. While the analysts of a later run work, TradingAgents settles every logged decision whose holding period has passed: it fetches the realised return (raw, and alpha against the instrument's regional benchmark) and generates a one-paragraph reflection. The Portfolio Manager then reads the most recent decisions for the same ticker plus recent lessons from other tickers, so each analysis carries forward what worked and what didn't. If settling fails, the run goes on and its report says so. An intraday plan is scored instead on its session's 5-minute bars, once that session's close is final and while Yahoo still serves them (about 60 days) ([intraday plans](#intraday-day-trader-plans)).
 
 Override the path with `TRADINGAGENTS_MEMORY_LOG_PATH`.
 
@@ -393,7 +430,7 @@ To settle decisions without running an analysis, for a scheduled job, call `ta.s
 
 ### Checkpoint resume
 
-Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves state after each node so a crashed or interrupted run resumes from the last successful step instead of starting over. The run view says whether it resumed a saved run or started fresh. Checkpoints are cleared automatically on successful completion.
+Checkpoint resume is opt-in via `--checkpoint`. When enabled, LangGraph saves state after each node so a crashed or interrupted run resumes from the last successful step instead of starting over. The run view says whether it resumed a saved run or started fresh. Checkpoints are cleared automatically on successful completion. Checkpoints saved by v0.7.1 are not resumed by this fork: such a run starts fresh.
 
 Per-ticker SQLite databases live at `~/.tradingagents/cache/checkpoints/<TICKER>.db` (override the base with `TRADINGAGENTS_CACHE_DIR`). Use `--clear-checkpoints` to reset all of them before a run.
 
@@ -457,7 +494,7 @@ Contributions are welcome: bug fixes, documentation, and feature ideas; past con
 
 ## Citation
 
-Please reference our work if you find *TradingAgents* provides you with some help :)
+If *TradingAgents* helps your work, please cite the paper by Xiao, Sun, Luo and Wang:
 
 ```
 @misc{xiao2025tradingagentsmultiagentsllmfinancial,

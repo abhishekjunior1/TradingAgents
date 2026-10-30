@@ -199,6 +199,18 @@ def _minutes(frame: pd.DataFrame, interval: str | None) -> int | None:
     return int(gaps.mode().iloc[0].total_seconds() // 60) if len(gaps) else None
 
 
+def _official_gap(daily: pd.DataFrame | None, target: date, before: pd.DataFrame | None) -> dict | None:
+    """``target``'s opening price from its daily bar against the daily close before it; None without both."""
+    if daily is None or before is None or len(daily) == 0 or "Open" not in daily.columns:
+        return None
+    dates = pd.to_datetime(daily["Date"]) if "Date" in daily.columns else pd.to_datetime(pd.Series(daily.index))
+    opens = pd.to_numeric(daily["Open"], errors="coerce").reset_index(drop=True)[list(dates.dt.date == target)]
+    previous = float(before["Close"].iloc[-1])
+    if opens.empty or not math.isfinite(float(opens.iloc[0])) or float(opens.iloc[0]) <= 0 or not previous > 0:
+        return None
+    return {"open": float(opens.iloc[0]), "previous_close": previous, "pct": (float(opens.iloc[0]) / previous - 1) * 100}
+
+
 def _daily_rows(daily: pd.DataFrame | None, before: date) -> pd.DataFrame | None:
     """Daily rows dated before ``before``, with a ``Day`` column; None when there are none."""
     if daily is None or len(daily) == 0 or not {"High", "Low", "Close"} <= set(daily.columns):
@@ -243,8 +255,10 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
     bars or else the daily rows; ``current`` (open, high, low, last, vwap, volume,
     bars, through) is ``target`` so far once it has a bar; ``opening_range`` maps
     15 and 30 minutes to their high and low once the bars cover them; ``pivots``
-    are classic floor pivots from ``last_session``; ``gap_pct`` is the open
-    against the previous close; ``relative_volume`` compares the volume so far
+    are classic floor pivots from ``last_session``; ``gap_pct`` is the first bar's
+    open against the previous close, and ``official_gap`` (open, previous_close,
+    pct) the daily bar's open, the exchange's opening price, against the previous
+    daily close; ``relative_volume`` compares the volume so far
     with the prior sessions' average to the same time of day, and
     ``last_session_relative_volume`` the last session's with the sessions before
     it (both averages leave out a special session on other hours, such as Muhurat
@@ -270,6 +284,7 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
         "opening_range": dict.fromkeys(OPENING_RANGE_MINUTES),
         "pivots": None,
         "gap_pct": None,
+        "official_gap": None,
         "relative_volume": None,
         "relative_volume_sessions": 0,
         "last_session_relative_volume": None,
@@ -331,6 +346,9 @@ def intraday_levels(bars: pd.DataFrame, daily: pd.DataFrame | None, target: date
         levels["last_vs_vwap_pct"] = (last / vwap - 1) * 100
     if levels["last_session"]:
         levels["gap_pct"] = (current["open"] / levels["last_session"]["close"] - 1) * 100
+    # NSE and BSE open in a pre-open auction, so the first bar (from 09:15) can start
+    # away from the opening price the daily bar carries.
+    levels["official_gap"] = _official_gap(daily, target, daily_rows)
 
     opened = (pd.Timestamp(datetime.combine(target, exchange.hours_on(target)[1]), tz=zone)
               if exchange is not None else today["Datetime"].iloc[0])
@@ -544,7 +562,11 @@ def format_intraday_snapshot(symbol: str, levels: Mapping, target: tuple[date, s
                   f"| VWAP | {_price(current['vwap'])} |",
                   f"| Last vs VWAP | {_pct(levels.get('last_vs_vwap_pct'))} |",
                   f"| Volume | {_volume(current['volume'])} |",
-                  f"| Gap at the open vs the previous close | {_pct(levels.get('gap_pct'))} |"]
+                  f"| Gap at the first bar's open vs the previous close | {_pct(levels.get('gap_pct'))} |"]
+        official = levels.get("official_gap")
+        if official:
+            lines.append(f"| Gap at the opening price (daily bar, {_price(official['open'])}) vs the previous daily "
+                         f"close ({_price(official['previous_close'])}) | {_pct(official['pct'])} |")
         relative = levels.get("relative_volume")
         if relative is not None:
             lines.append(f"| Relative volume (vs the {levels['relative_volume_sessions']} prior sessions' average "

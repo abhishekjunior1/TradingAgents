@@ -332,12 +332,29 @@ def test_the_snapshot_names_the_bars_behind_every_number():
     assert "Plan for: Thu 29 Oct 2026, the rest of today's session, open until 15:30 IST." in text
     assert "Exit by: 15:10 IST" in text
     assert "## Last complete session: Wed 28 Oct 2026 (from the 5m bars)" in text
-    assert "| VWAP | 106.438 |" in text and "| Gap at the open vs the previous close | +2.00% |" in text
+    assert "| VWAP | 106.438 |" in text and "| Gap at the first bar's open vs the previous close | +2.00% |" in text
+    assert "Gap at the opening price" not in text      # the daily rows end the day before
     assert "| Opening range, first 15 minutes | high 109.00, low 104.00 |" in text
     assert "| 122.00 | 116.00 | 110.00 | 104.00 | 98.00 | 92.00 | 86.00 |" in text
     assert "₹1,00,000.00" in text and "'india_equity_intraday'" in text and "no order is placed" in text
     assert "| 29 Oct 10:00 | 107.00 | 108.00 | 106.00 | 107.00 | 200 |" in text
     assert "- A note." in text
+
+
+@pytest.mark.unit
+def test_the_snapshot_also_gives_the_gap_at_the_exchanges_opening_price():
+    # NSE opens in a pre-open auction: the daily bar's open can differ from the first 5m bar's
+    # (TCS on 30 Oct 2026: 2495.20 against 2507.20, a gap of +0.69% rather than +1.18%).
+    now = _at(THURSDAY, 10, 7)
+    daily = _daily(end="2026-10-29")
+    daily.loc[daily["Date"] == pd.Timestamp(THURSDAY), "Open"] = 101.0
+    levels = intraday_levels(BARS, daily, THURSDAY, now, interval="5m", exchange=NSE)
+    text = format_intraday_snapshot("RELIANCE.NS", levels, target_session(NSE, THURSDAY, now), time(15, 10),
+                                    [None], [], recent_bars=BARS, fetched_at=now)
+
+    assert levels["official_gap"] == {"open": 101.0, "previous_close": 100.0, "pct": pytest.approx(1.0)}
+    assert "| Gap at the first bar's open vs the previous close | +2.00% |" in text
+    assert "| Gap at the opening price (daily bar, 101.00) vs the previous daily close (100.00) | +1.00% |" in text
     assert text.rstrip().endswith("tool's output.") and "source of truth for intraday prices" in text
 
     past = format_intraday_snapshot("RELIANCE.NS", levels, (FRIDAY, "the next trading day"), None, [], [])
